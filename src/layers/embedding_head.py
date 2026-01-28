@@ -61,20 +61,23 @@ class VocabParallelEmbedding(nn.Module):
             The output tensor of shape (batch_size, seq_len, embedding_dim).
         """
         if self.tp_size > 1:
-            # With parallel embedding, we need to mask the input to only include the embeddings on the current device.
+            # Filter out the indices that are responsible for the current device.
+            # mask shape: (batch_size, seq_len)
             mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
-            # Convert the input to the index of the embeddings on the current device, start from 0.
+            # `x-self.vocab_start_idx` convert the global token ID to the local index on the current device.
+            # For example, the global token ID is 1200, the beginning index of the current device is 1000,
+            # so the local index on the current device is 1200-1000=200.
+            # Tokens that are not responsible for the current device will be masked to 0, which is temporary placeholder,
+            # and will be filtered out in the next step.
             x = mask*(x-self.vocab_start_idx)
             
         # output shape: (batch_size, seq_len, embedding_dim)
         output = F.embedding(x, self.weight)
         
-        # With parallel embedding, the output elements of "mask == False" and "x == self.vocab_start_idx" are all zeros,
-        # so we need to distinguish them.
-        # So, we need to mask the output to only include the embeddings on the current device.
+        # The output elements of "mask == False" and "x == self.vocab_start_idx" are all `self.weight[0]`,
+        # so we need to distinguish them and filter the temporary placeholder generate by "mask == False".
         if self.tp_size > 1:
-            output = mask.unsqueeze(1)*output
-            # For each token embedding, there is non-zero value on only one device.
+            output = mask.unsqueeze(-1)*output
             dist.all_reduce(output, op=dist.ReduceOp.SUM)
         
         return output

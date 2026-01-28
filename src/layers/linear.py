@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.distributed as dist
 
 class LinearBase(nn.Module):
@@ -20,8 +21,14 @@ class LinearBase(nn.Module):
         bias: bool = True,
         tp_dim: int|None = None,
     ):
+        """
+        Args:
+            input_size: The size of the input features.
+            output_size: The size of the output features.
+            bias: Whether to include a bias term. Defaults to True.
+            tp_dim: The dimension to parallelize. Defaults to None.
+        """
         super().__init__()
-        # `tp_dim` is the dimension to parallelize
         self.tp_dim = tp_dim
         # `tp_rank` is the rank of the current device
         self.tp_rank = dist.get_rank()
@@ -79,13 +86,19 @@ class ReplicatedLinear(LinearBase):
         output_size: int,
         bias: bool = True,
     ):
+        """
+        Args:
+            input_size: The size of the input features.
+            output_size: The size of the output features.
+            bias: Whether to include a bias term. Defaults to True.
+        """
         super().__init__(input_size, output_size, bias)
     
     def weight_loader(self, param: nn.Parameter, loaded_weights: nn.Parameter):
         param.data.copy_(loaded_weights)
     
     def forward(self, x: torch.Tensor):
-        return nn.functional.linear(x, self.weight, self.bias)
+        return F.linear(x, self.weight, self.bias)
 
 class ColumnParallelLinear(LinearBase):
     """
@@ -98,6 +111,12 @@ class ColumnParallelLinear(LinearBase):
         output_size: int,
         bias: bool = True,
     ):
+        """
+        Args:
+            input_size: The size of the input features.
+            output_size: The size of the output features.
+            bias: Whether to include a bias term. Defaults to True.
+        """
         tp_size = dist.get_world_size()
         # Output dimension must be divisible by the number of devices
         # to ensure each device gets equal share of the output features.
@@ -105,6 +124,12 @@ class ColumnParallelLinear(LinearBase):
         super().__init__(input_size, output_size//tp_size, bias, tp_dim=0)
     
     def weight_loader(self, param: nn.Parameter, loaded_weights: nn.Parameter):
+        """
+        Load the weight from the checkpoint.
+        Args:
+            param: The parameter to load the weight to.
+            loaded_weights: The weight to load.
+        """
         # Calculate the shard size and check if it matches the initialized parameter data size.
         param_data = param.data
         full_data_output_size = loaded_weights.size(0)
@@ -116,7 +141,7 @@ class ColumnParallelLinear(LinearBase):
         param_data.copy_(slided_weight)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return nn.functional.linear(x, self.weight, self.bias)
+        return F.linear(x, self.weight, self.bias)
 
 class RowParallelLinear(LinearBase):
     """
@@ -129,6 +154,12 @@ class RowParallelLinear(LinearBase):
         output_size: int,
         bias: bool = True,
     ):
+        """
+        Args:
+            input_size: The size of the input features.
+            output_size: The size of the output features.
+            bias: Whether to include a bias term. Defaults to True.
+        """
         tp_size = dist.get_world_size()
         # Input dimension must be divisible by the number of devices
         # to ensure each device gets equal share of the input features.
@@ -136,6 +167,12 @@ class RowParallelLinear(LinearBase):
         super().__init__(input_size//tp_size, output_size, bias, tp_dim=1)
     
     def weight_loader(self, param: nn.Parameter, loaded_weights: nn.Parameter):
+        """
+        Load the weight from the checkpoint.
+        Args:
+            param: The parameter to load the weight to.
+            loaded_weights: The weight to load.
+        """
         # Calculate the shard size and check if it matches the initialized parameter data size.
         param_data = param.data
         full_data_input_size = loaded_weights.size(1)
@@ -149,7 +186,7 @@ class RowParallelLinear(LinearBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Row parallel layer usually follows a column parallel layer.
         # `x` is the output of the column parallel layer.
-        result = nn.functional.linear(x, self.weight, self.bias)
+        result = F.linear(x, self.weight, self.bias)
         # Reduce the output across all devices.
         if self.tp_size > 1:
             dist.all_reduce(result, op=dist.ReduceOp.SUM)

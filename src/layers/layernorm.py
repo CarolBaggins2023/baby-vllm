@@ -9,6 +9,11 @@ class LayerNorm(nn.Module):
     
     @torch.compile
     def __init__(self, gamma: torch.Tensor, eps: float = 1e-5):
+        """
+        Args:
+            gamma: The scale parameter.
+            eps: The epsilon value to avoid division by zero. Defaults to 1e-5.
+        """
         super().__init__()
         self.register_buffer("gamma", gamma)
         self.eps = eps

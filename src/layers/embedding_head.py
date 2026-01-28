@@ -1,0 +1,129 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.distributed as dist
+
+from utils.context import get_context
+
+
+class VocabParallelEmbedding(nn.Module):
+    """
+    Embedding layer maps the input indices to the corresponding embeddings.
+    Parallel embedding layer splits the embeddings across multiple devices.
+    """
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        """
+        Args:
+            num_embeddings: The number of embeddings.
+            embedding_dim: The dimension of the embeddings.
+        """
+        super().__init__()
+        self.tp_size = dist.get_world_size()
+        self.tp_rank = dist.get_rank()
+        
+        self.num_embeddings = num_embeddings
+        # Each device should store the same number of part embeddings,
+        # so pad the number of embeddings to be divisible by `tp_size`.
+        self.padded_num_embeddings = (num_embeddings+self.tp_size-1)//self.tp_size*self.tp_size
+        self.num_embeddings_per_partition = self.padded_num_embeddings//self.tp_size
+        self.embedding_dim = embedding_dim
+        
+        # The start and end index of the vocabulary on the current device.
+        self.vocab_start_idx = self.tp_rank*self.num_embeddings_per_partition
+        self.vocab_end_idx = min(self.vocab_start_idx+self.num_embeddings_per_partition, self.num_embeddings)
+        
+        # weight shape: (num_embeddings_per_partition, embedding_dim)
+        self.weight = nn.Parameter(torch.empty(self.num_embeddings_per_partition, self.embedding_dim))
+        self.weight.weight_loader = self.weight_loader
+
+    def weight_loader(self, param: nn.Parameter, loaded_weights: nn.Parameter):
+        """
+        Load the weight from the checkpoint.
+        Args:
+            param: The parameter to load the weight to.
+            loaded_weights: The weight to load.
+        """
+        param_data = param.data
+        
+        shard_size = self.vocab_end_idx-self.vocab_start_idx
+        slided_weights = loaded_weights.narrow(0, self.vocab_start_idx, shard_size)
+        # Load the weight to the current device.
+        # If needed, pad the weight with zeros.
+        param_data[:shard_size] = slided_weights
+        if shard_size < self.num_embeddings_per_partition:
+            param_data[shard_size:].zeros_()
+    
+    def forward(self, x: torch.Tensor):
+        """
+        Args:
+            x: The input tensor of shape (batch_size, seq_len).
+        Returns:
+            The output tensor of shape (batch_size, seq_len, embedding_dim).
+        """
+        if self.tp_size > 1:
+            # With parallel embedding, we need to mask the input to only include the embeddings on the current device.
+            mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
+            # Convert the input to the index of the embeddings on the current device, start from 0.
+            x = mask*(x-self.vocab_start_idx)
+            
+        # output shape: (batch_size, seq_len, embedding_dim)
+        output = F.embedding(x, self.weight)
+        
+        # With parallel embedding, the output elements of "mask == False" and "x == self.vocab_start_idx" are all zeros,
+        # so we need to distinguish them.
+        # So, we need to mask the output to only include the embeddings on the current device.
+        if self.tp_size > 1:
+            output = mask.unsqueeze(1)*output
+            # For each token embedding, there is non-zero value on only one device.
+            dist.all_reduce(output, op=dist.ReduceOp.SUM)
+        
+        return output
+        
+
+class ParallelLMHead(VocabParallelEmbedding):
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        """
+        Args:
+            num_embeddings: The number of embeddings.
+            embedding_dim: The dimension of the embeddings.
+        """
+        super().__init__(num_embeddings, embedding_dim)
+    
+    def forward(self, x: torch.Tensor):
+        """
+        Args:
+            x: The input tensor of shape (batch_size, seq_len, embedding_dim).
+        Returns:
+            The logits tensor of shape (batch_size, seq_len, num_embeddings).
+        """
+        context = get_context()
+        if context.is_prefill:
+            # In prefill stage, shape of input tensor is (total_tokens, embedding_dim).
+            # We only need the logits of the last token in each sequence.
+            # Exclude the first element in `cu_seqlens_q`, which is always 0.
+            # `last_token` is the "index" of the last token in each sequence, so minus 1.
+            last_token = context.cu_seqlens_q[1:]-1
+            x = x[last_token].contiguous()
+        
+        # `F.linear` automatically transpose the weight matrix.
+        # `self.weight` is derived from the parallel embedding layer, which achieves parameter sharing.
+        # logits shape: (batch_size, seq_len, num_embeddings_per_partition)
+        logits = F.linear(x, self.weight)
+        if self.tp_size > 1:
+            # GPU 0 gathers the logits from all GPUs.
+            all_logits = None
+            if self.tp_rank == 0:
+                all_logits = [torch.empty(logits.size(), device=logits.device) for _ in range(self.tp_size)]
+            dist.gather(logits, all_logits, dst=0)
+            
+            # Concatenate the logits from all GPUs and trim the extra embeddings.
+            if self.tp_rank == 0:
+                # logits shape: (batch_size, seq_len, padded_num_embeddings)
+                logits = torch.cat(all_logits, dim=-1)
+                # logits shape: (batch_size, seq_len, num_embeddings)
+                logits = logits[:, :, :self.num_embeddings]
+            
+        # No need to broadcast the logits to all GPUs, since the main GPU will execute the sampling.
+        
+        return logits
+    

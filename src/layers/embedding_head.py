@@ -100,8 +100,6 @@ class ParallelLMHead(VocabParallelEmbedding):
         if context.is_prefill:
             # In prefill stage, shape of input tensor is (total_tokens, embedding_dim).
             # We only need the logits of the last token in each sequence.
-            # Exclude the first element in `cu_seqlens_q`, which is always 0.
-            # `last_token` is the "index" of the last token in each sequence, so minus 1.
             last_token = context.cu_seqlens_q[1:]-1
             x = x[last_token].contiguous()
         

@@ -29,14 +29,21 @@ class Context:
     # `max_seqlen_k` is the maximum sequence length of the keys and values.
     max_seqlen_k: int = 0
     
-_context = Context()
+    # 1-dimension tensor, which has size of token number.
+    # It maps token index to cache slot index and maps padded token to -1.
+    # For example, there are token 0, token 1 and padded token 2 and padded token 3.
+    # If token 0 is written at cache slot 0, token 1 is written at cache slot 1,
+    # slot_mapping should be [0, 1, -1, -1]
+    slot_mapping: torch.Tensor = None
+    
+_CONTEXT = Context()
 
 def get_context() -> Context:
-    return _context
+    return _CONTEXT
 
 def reset_context():
-    global _context
-    _context = Context()
+    global _CONTEXT
+    _CONTEXT = Context()
 
 def set_context(
     is_prefill,
@@ -45,8 +52,8 @@ def set_context(
     cu_seqlens_k = None,
     max_seqlen_k = 0,
 ):
-    global _context
-    _context = Context(
+    global _CONTEXT
+    _CONTEXT = Context(
         is_prefill,
         cu_seqlens_q,
         max_seqlen_q,

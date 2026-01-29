@@ -29,12 +29,21 @@ class Context:
     # `max_seqlen_k` is the maximum sequence length of the keys and values.
     max_seqlen_k: int = 0
     
-    # 1-dimension tensor, which has size of token number.
+    # `slot_mapping` maps token index to slot index in cache block. sequence <-> cache block
+    # `block_tables` maps sequence index to cache block indexs. token <-> slot in cache block
+    
+    # 1-dimension tensor, with shape of (num_tokens,).
     # It maps token index to cache slot index and maps padded token to -1.
     # For example, there are token 0, token 1 and padded token 2 and padded token 3.
     # If token 0 is written at cache slot 0, token 1 is written at cache slot 1,
-    # slot_mapping should be [0, 1, -1, -1]
+    # `slot_mapping` should be [0, 1, -1, -1].
     slot_mapping: torch.Tensor = None
+    
+    # 2-dimension tensor, with shape of (num_sequences, num_blocks_per_sequence).
+    # It maps sequence index to cache block indexs.
+    # For examples, if Sequence 0 use Cache Block 0 and Cache Block 1, Sequence 1 use Cache Block 2,
+    # then `block_tables` should be [[0, 1], [2]].
+    block_tables: torch.Tensor = None
     
 _CONTEXT = Context()
 

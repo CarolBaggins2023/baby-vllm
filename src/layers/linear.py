@@ -45,7 +45,7 @@ class LinearBase(nn.Module):
         else:
             register_parameter('bias', None)
 
-    def weight_loader(self, param: nn.Parameter, loaded_weights: nn.Parameter):
+    def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor):
         """
         Load a saved model checkpoint.
         
@@ -94,7 +94,7 @@ class ReplicatedLinear(LinearBase):
         """
         super().__init__(input_size, output_size, bias)
     
-    def weight_loader(self, param: nn.Parameter, loaded_weights: nn.Parameter):
+    def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor):
         param.data.copy_(loaded_weights)
     
     def forward(self, x: torch.Tensor):
@@ -123,7 +123,7 @@ class ColumnParallelLinear(LinearBase):
         assert output_size%tp_size == 0, f"Output size {output_size} must be divisible by tensor parallel size {tp_size}"
         super().__init__(input_size, output_size//tp_size, bias, tp_dim=0)
     
-    def weight_loader(self, param: nn.Parameter, loaded_weights: nn.Parameter):
+    def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor):
         """
         Load the weight from the checkpoint.
         Args:
@@ -142,6 +142,54 @@ class ColumnParallelLinear(LinearBase):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.weight, self.bias)
+
+class QKVColumnParallelLinear(ColumnParallelLinear):
+    def __init__(
+        self,
+        input_size: int,
+        head_size: int,
+        num_heads: int,
+        num_kv_heads: int|None = None,
+        bias: bool = False,
+    ):
+        self.tp_size = dist.get_world_size()
+        self.head_size = head_size
+        self.num_heads = num_heads//self.tp_size
+        self.num_kv_heads = num_kv_heads//self.tp_size if num_kv_heads is not None else self.num_heads
+        total_output_size = head_size*(num_heads+2*num_kv_heads)
+        super().__init__(input_size, total_output_size, bias)
+    
+    def weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weights: torch.Tensor,
+        loaded_weight_id: str,
+    ):
+        """
+        Load the q, k, or v weight from the checkpoint.
+        Args:
+            param: The parameter to load the weight to.
+            loaded_weights: The weight to load.
+            loaded_weight_id: Whether to load the q, k, or v weight.
+        """
+        param_data = param.data
+        assert loaded_weight_id in ['q', 'k', 'v'], f"Loaded weight id {loaded_weight_id} must be in ['q', 'k', 'v']"
+        # The offset depends on the loaded weight id, since qkv are concatenated.
+        if loaded_weight_id == 'q':
+            offset = 0
+            shard_size = self.head_size*self.num_heads
+        elif loaded_weight_id == 'k':
+            offset = self.head_size*self.num_heads
+            shard_size = self.head_size*self.num_kv_heads
+        else:
+            offset = self.head_size*self.num_heads+self.head_size*self.num_heads
+            shard_size = self.head_size*self.num_kv_heads
+        
+        # Copy the shard corresponding to the current GPU to the parameter data.
+        slided_weights_start_idx = self.tp_rank*shard_size
+        slided_weights = loaded_weights.narrow(0, slided_weights_start_idx, shard_size)
+        param_data = param_data.narrow(0, offset, shard_size)
+        param_data.copy_(slided_weights)
 
 class RowParallelLinear(LinearBase):
     """
@@ -166,7 +214,7 @@ class RowParallelLinear(LinearBase):
         assert input_size%tp_size == 0, f"Input size {input_size} must be divisible by tensor parallel size {tp_size}"
         super().__init__(input_size//tp_size, output_size, bias, tp_dim=1)
     
-    def weight_loader(self, param: nn.Parameter, loaded_weights: nn.Parameter):
+    def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor):
         """
         Load the weight from the checkpoint.
         Args:

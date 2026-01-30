@@ -50,7 +50,7 @@ def apply_rotary_pos_embedding(
     else:
         raise ValueError(f"Input tensor to rotary embedding must be 3D or 4D, but got {x.dim()}D")
 
-class RotarryEmbedding(nn.Module):
+class RotaryEmbedding(nn.Module):
     def __init__(self,
         base: int,
         rotary_dim: int,

@@ -144,6 +144,10 @@ class ColumnParallelLinear(LinearBase):
         return F.linear(x, self.weight, self.bias)
 
 class QKVColumnParallelLinear(ColumnParallelLinear):
+    """
+    QKVColumnParallelLinear is a linear layer where the output dimension is parallelized across multiple devices.
+    It contains part of the q, k, and v weights in a single linear layer.
+    """
     def __init__(
         self,
         input_size: int,
@@ -152,6 +156,14 @@ class QKVColumnParallelLinear(ColumnParallelLinear):
         num_kv_heads: int|None = None,
         bias: bool = False,
     ):
+        """
+        Args:
+            input_size: The size of the input features.
+            head_size: The size of each head.
+            num_heads: The number of heads.
+            num_kv_heads: The number of kv heads. Defaults to None.
+            bias: Whether to include a bias term. Defaults to False.
+        """
         self.tp_size = dist.get_world_size()
         self.head_size = head_size
         self.num_heads = num_heads//self.tp_size
@@ -190,6 +202,57 @@ class QKVColumnParallelLinear(ColumnParallelLinear):
         slided_weights = loaded_weights.narrow(0, slided_weights_start_idx, shard_size)
         param_data = param_data.narrow(0, offset, shard_size)
         param_data.copy_(slided_weights)
+
+class MergedColumnParallelLinear(ColumnParallelLinear):
+    def __init__(
+        self,
+        input_size: int,
+        output_sizes: list[int],
+        bias: bool = True,
+    ):
+        """
+        Args:
+            input_size: The size of the input features.
+            output_sizes: The sizes of several output features.
+            bias: Whether to include a bias term. Defaults to True.
+        """
+        self.output_sizes = output_sizes
+        super().__init__(input_size, sum(output_sizes), bias)
+    
+    def weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weights: torch.Tensor,
+        loaded_weight_id: int,
+    ):
+        """
+        Load the weight from the checkpoint.
+        Args:
+            param: The parameter to load the weight to.
+            loaded_weights: The weight to load.
+            loaded_weight_id: The id of the loaded weight.
+            
+        For example, gate projection and up projection in MLP are merged into a single linear layer.
+        checkpoint = {
+            'mlp.gate_proj.weight': torch.randn(intermediate_size, hidden_size),
+            'mlp.up_proj.weight': torch.randn(intermediate_size, hidden_size),
+            'mlp.down_proj.weight': torch.randn(hidden_size, intermediate_size),
+        }
+        load to
+        merged_layer = Linear(
+            intput_size=intermediate_size,
+            output_sizes=sum([intermediate_size, intermediate_size]), # gate and up
+        )
+        """
+        param_data = param.data
+        offset = sum(self.output_sizes[:loaded_weight_id])//self.tp_size
+        shard_size = self.output_sizes[loaded_weight_id]//self.tp_size
+        # split along the output dimension
+        param_data = param_data.narrow(0, offset, shard_size)
+        loaded_weights_start_idx = self.tp_rank*shard_size
+        slided_weights = loaded_weights.narrow(0, loaded_weights_start_idx, shard_size)
+        param_data.copy_(slided_weights)
+        
 
 class RowParallelLinear(LinearBase):
     """

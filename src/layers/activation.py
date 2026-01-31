@@ -5,7 +5,7 @@ import time
 
 class SiluAndMul(nn.Module):
     """
-    SiLU activation followed by element-wise multiplication.
+    SiLU activation followed by element-wise multiplication, which is used in MLP.
     """
     
     def __init__(self):
@@ -13,6 +13,7 @@ class SiluAndMul(nn.Module):
     
     @torch.compile
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # In MLP, x is the output of gate projection and y is the output of up projection.
         x, y = x.chunk(2, -1)
         return F.silu(x)*y
 

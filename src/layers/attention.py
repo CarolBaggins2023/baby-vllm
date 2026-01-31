@@ -115,7 +115,13 @@ def store_kvcache(
     store_kvcache_kernel[(num_tokens,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D=num_kv_heads*head_dim)
 
 class Attention(nn.Module):
-    def __init__(self, num_heads: int, head_dim: int, scale: float = 1.0, num_kv_heads: int = None):
+    def __init__(
+        self,
+        num_heads: int,
+        head_dim: int,
+        scale: float = 1.0,
+        num_kv_heads: int = None
+    ):
         """
         Args:
             num_heads (int): The number of query attention heads.

@@ -56,9 +56,9 @@ class VocabParallelEmbedding(nn.Module):
     def forward(self, x: torch.Tensor):
         """
         Args:
-            x: The input tensor of shape (batch_size, seq_len).
+            x: The input tensor of shape (total_tokens,) in prefill stage or (batch_size,) in decode stage.
         Returns:
-            The output tensor of shape (batch_size, seq_len, embedding_dim).
+            The output tensor of shape (total_tokens, embedding_dim) in prefill stage or (batch_size, embedding_dim) in decode stage.
         """
         if self.tp_size > 1:
             # Filter out the indices that are responsible for the current device.
@@ -95,9 +95,9 @@ class ParallelLMHead(VocabParallelEmbedding):
     def forward(self, x: torch.Tensor):
         """
         Args:
-            x: The input tensor of shape (batch_size, seq_len, embedding_dim).
+            x: The input tensor of shape (total_tokens, embedding_dim) in prefill stage or (batch_size, embedding_dim) in decode stage.
         Returns:
-            The logits tensor of shape (batch_size, seq_len, num_embeddings).
+            The logits tensor of shape (batch_size, num_embeddings).
         """
         context = get_context()
         if context.is_prefill:

@@ -3,8 +3,16 @@ import torch.nn as nn
 import torch.distributed as dist
 
 from layers import *
+from utils import get_context
 
 class Qwen3Attention(nn.Module):
+    """
+    Attention Block in Qwen3.
+    (1) QKV Projection and Split
+    (2) Normalize Q and K and Apply Rotary Embedding
+    (3) Scaled Dot-Product Attention
+    (4) Output Projection
+    """
     def __init__(
         self,
         hidden_size: int,
@@ -12,6 +20,7 @@ class Qwen3Attention(nn.Module):
         head_dim: int|None = None,
         scale: float = 1.0,
         num_kv_heads: int|None = None,
+        rms_norm_epsilon: float = 1e-5,
         qkv_bias: bool = False,
         base: int = 10000,
         max_position: int = 16384,
@@ -111,17 +120,23 @@ class Qwen3Attention(nn.Module):
         # Apply rotary embedding to q and k.
         q, k = self.rotary_emb(positions, q, k)
         
-        # ===== (4) Scaled Dot-Product Attention =====
+        # ===== (3) Scaled Dot-Product Attention =====
         # o shape: (batch_size*seq_len, num_heads, head_dim)
         o = self.attention(q, k, v)
         
-        # ===== (5) Output Projection (Communication Happens by All Reduce) =====
+        # ===== (4) Output Projection (Communication Happens by All Reduce) =====
         # o shape: (batch_size*seq_len, hidden_size)
         o = self.out_projection(o)
         
         return o
 
 class Qwen3MLP(nn.Module):
+    """
+    MLP Block in Qwen3.
+    (1) Gate-Up Projection
+    (2) Activation
+    (3) Down Projection
+    """
     def __init__(
         self,
         hidden_size: int,
@@ -148,10 +163,202 @@ class Qwen3MLP(nn.Module):
         return x
 
 class Qwen3DecoderLayer(nn.Module):
-    pass
+    """
+    Decoder Layer in Qwen3.
+    (1) Input LayerNorm
+    (2) Self-Attention
+    (3) Post-Attention LayerNorm
+    (4) MLP
+    """
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        head_dim: int|None = None,
+        scale: float = 1.0,
+        num_kv_heads: int|None = None,
+        rms_norm_epsilon: float = 1e-5,
+        qkv_bias: bool = False,
+        base: int = 10000,
+        max_position: int = 16384,
+        intermediate_size: int = 4*1024,
+        ffn_bias: bool = True,
+    ):
+        super().__init__()
+        
+        gemma = torch.ones(hidden_size)
+        self.input_layernorm = LayerNorm(gamma=gemma)
+        self.self_attn = Qwen3Attention(
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            scale=scale,
+            num_kv_heads=num_kv_heads,
+            rms_norm_epsilon=rms_norm_epsilon,
+            qkv_bias=qkv_bias,
+            base=base,
+            max_position=max_position,
+        )
+        self.post_attn_layernorm = LayerNorm(gamma=gemma)
+        self.mlp = Qwen3MLP(
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            bias=ffn_bias,
+        )
+    
+    def forward(self, x: torch.Tensor, residual: torch.Tensor|None = None) -> torch.Tensor:
+        # Shape of input depends on whether it is on prefill or decode stage.
+        
+        # (1) Input LayerNorm
+        if residual is not None:
+            x, residual = self.input_layernorm(x, residual)
+        else:
+            x = self.input_layernorm(x)
+            residual = x
+            
+        # (2) Calculate Positions and Self-Attention
+        context = get_context()
+        # Batched Prefill
+        if context.is_prefill and context.cu_seqlens_q is not None:
+            # Position indices for each sequence in the batch restart from 0.
+            # For example, if cu_seqlens_q is [0, 5, 8, 12],
+            # the start and end indices of each sequence are [0, 4], [5, 7], [8, 11].
+            # Position indices for each sequence are
+            # Sequence 0: [0, 1, 2, 3, 4],
+            # Sequence 1: [0, 1, 2],
+            # Sequence 2: [0, 1, 2, 3].
+            positions = []
+            cu_seqlens = context.cu_seqlens_q.cpu().tolist()
+            for i in range(len(cu_seqlens)-1):
+                seq_len = cu_seqlens[i+1]-cu_seqlens[i]
+                positions.extend(range(seq_len))
+            positions = torch.tensor(positions, dtype=torch.long, device=x.device)
+        # Single Sequence Prefill
+        elif context.is_prefill:
+            positions = torch.arange(x.size(0), device=x.device)
+        # Decode
+        else:
+            # In each sequence, the position index of last token is the sequence length - 1.
+            positions = context.context_lens-1
+        
+        x = self.self_attn(x, positions)
+        
+        # (3) Post-Attention LayerNorm
+        x, residual = self.post_attn_layernorm(x, residual)
+        
+        # (4) MLP
+        x = self.mlp(x)
+        
+        return x, residual
 
 class Qwen3Model(nn.Module):
-    pass
+    """
+    Qwen3 Model.
+    (1) Embedding
+    (2) Multiple Self-Attention and MLP
+    (3) Final LayerNorm
+    """
+    def __init__(
+        self,
+        vocab_size: int,
+        hidden_size: int,
+        num_heads: int,
+        head_dim: int|None = None,
+        scale: float = 1.0,
+        num_kv_heads: int|None = None,
+        rms_norm_epsilon: float = 1e-5,
+        qkv_bias: bool = False,
+        base: int = 10000,
+        max_position: int = 16384,
+        intermediate_size: int = 4*1024,
+        ffn_bias: bool = True,
+        num_layers: int = 12,
+    ):
+        super().__init__()
+        
+        self.embedding_layer = VocabParallelEmbedding(
+            num_embeddings=vocab_size,
+            embedding_dim=hidden_size,
+        )
+        self.layer_stack = nn.ModuleList([
+            Qwen3DecoderLayer(
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                scale=scale,
+                num_kv_heads=num_kv_heads,
+                rms_norm_epsilon=rms_norm_epsilon,
+                qkv_bias=qkv_bias,
+                base=base,
+                max_position=max_position,
+                intermediate_size=intermediate_size,
+                ffn_bias=ffn_bias,
+            ) for _ in range(num_layers)
+        ])
+        self.final_layernorm = LayerNorm(gamma=torch.ones(hidden_size))
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # (1) Embedding
+        x = self.embedding_layer(x)
+        
+        # (2) Multiple Self-Attention and MLP
+        residual = None
+        for layer in self.layer_stack:
+            x, residual = layer(x, residual)
+        
+        # (3) Final LayerNorm
+        x, _ = self.final_layernorm(x, residual)
+        
+        return x
 
 class Qwen3ForCausalLM(nn.Module):
-    pass
+    def __init__(
+        self,
+        vocab_size: int,
+        hidden_size: int,
+        num_heads: int,
+        head_dim: int|None = None,
+        scale: float = 1.0,
+        num_kv_heads: int|None = None,
+        rms_norm_epsilon: float = 1e-5,
+        qkv_bias: bool = False,
+        base: int = 10000,
+        max_position: int = 16384,
+        intermediate_size: int = 4*1024,
+        ffn_bias: bool = True,
+        num_layers: int = 12,
+        tie_word_embeddings: bool = False, # Whether to tie the word embeddings and the LM head.
+    ):
+        super().__init__()
+        
+        self.qwen3_model = Qwen3Model(
+            vocab_size=vocab_size,
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            scale=scale,
+            num_kv_heads=num_kv_heads,
+            rms_norm_epsilon=rms_norm_epsilon,
+            qkv_bias=qkv_bias,
+            base=base,
+            max_position=max_position,
+            intermediate_size=intermediate_size,
+            ffn_bias=ffn_bias,
+            num_layers=num_layers,
+        )
+        
+        self.lm_head = ParallelLMHead(
+            num_embeddings=vocab_size,
+            embedding_dim=hidden_size,
+        )
+        
+        if tie_word_embeddings:
+            self.lm_head.weight = self.qwen3_model.embedding_layer.weight
+    
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        x = self.qwen3_model(input_ids)
+        return x
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        logits = self.lm_head(hidden_states)
+        return logits

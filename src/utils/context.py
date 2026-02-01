@@ -18,14 +18,14 @@ class Context:
     # Therefore, based on `cu_seqlens_q`, we can get:
     # (1) The begin index of each sequence: `cu_seqlens_q[:-1]`
     # (2) The end index of each sequence: `cu_seqlens_q[1:]`
-    cu_seqlens_q: torch.Tensor = None
+    cu_seqlens_q: torch.Tensor|None = None
     # `max_seqlen_q` is the maximum sequence length of the queries.
     # For example, in the above example, the longest sequence is Sequence 2, with length 5,
     # so `max_seqlen_q` is 5.
     max_seqlen_q: int = 0
     # `cu_seqlens_k` is the cumulative sequence lengths of the keys and values.
     # It has the same data structure as `cu_seqlens_q`.
-    cu_seqlens_k: torch.Tensor = None
+    cu_seqlens_k: torch.Tensor|None = None
     # `max_seqlen_k` is the maximum sequence length of the keys and values.
     max_seqlen_k: int = 0
     
@@ -37,13 +37,22 @@ class Context:
     # For example, there are token 0, token 1 and padded token 2 and padded token 3.
     # If token 0 is written at cache slot 0, token 1 is written at cache slot 1,
     # `slot_mapping` should be [0, 1, -1, -1].
-    slot_mapping: torch.Tensor = None
+    slot_mapping: torch.Tensor|None = None
     
     # 2-dimension tensor, with shape of (num_sequences, num_blocks_per_sequence).
     # It maps sequence index to cache block indexs.
     # For examples, if Sequence 0 use Cache Block 0 and Cache Block 1, Sequence 1 use Cache Block 2,
     # then `block_tables` should be [[0, 1], [2]].
-    block_tables: torch.Tensor = None
+    block_tables: torch.Tensor|None = None
+    
+    # 1-dimension tensor, with shape of (num_sequences,).
+    # It records the number of handled tokens (prompt length in prefill,
+    # or generated length in decode) in each sequence.
+    # For example, if Sequence 0 has 5 tokens in prompt, Sequence 1 has 3 tokens in prompt,
+    # then the `context_lens` is [5, 3] after prefilling.
+    # After prefilling and before first decoding, `context_lens` is still [5, 3].
+    # After first deocoding and before second decoding, `context_lens` becomes [6, 4].
+    context_lens: torch.Tensor|None = None
     
 _CONTEXT = Context()
 

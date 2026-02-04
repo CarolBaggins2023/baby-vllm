@@ -150,6 +150,17 @@ class Attention(nn.Module):
         if context.is_prefill:
             if context.block_tables is not None:
                 k, v = k_cache, v_cache
+            
+            # Reshape q, k, v from (batch_size, seq_len, num_heads/num_kv_heads, head_dim) to
+            # (total_tokens, num_heads/num_kv_heads, head_dim)
+            # This is required by flash_attn_varlen_func which expects 3D tensors
+            if q.dim() == 4:
+                q = q.reshape(-1, q.shape[2], q.shape[3])
+            if k.dim() == 4:
+                k = k.reshape(-1, k.shape[2], k.shape[3])
+            if v.dim() == 4:
+                v = v.reshape(-1, v.shape[2], v.shape[3])
+            
             o = flash_attn_varlen_func(
                 q, k, v,
                 max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,

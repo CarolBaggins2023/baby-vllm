@@ -35,11 +35,10 @@ def simple_test():
                 world_size=1,
                 rank=0
             )
-            print("分布式环境初始化成功")
             print("Successfully initialize distributed environment")
 
         # Create model and move to GPU.
-        model = Qwen3ForCausalLM(**test_params).to(device)
+        model = Qwen3ForCausalLM(**test_params).to(device).half()
         print("Successfully create model and move to GPU")
         
         # Create test input and move to GPU.
@@ -50,9 +49,9 @@ def simple_test():
         # Set context (ensure tensors are on the correct device).
         set_context(
             is_prefill=True,
-            cu_seqlens_q=torch.tensor([0, batch_size * seq_len], device=device),
+            cu_seqlens_q=torch.tensor([0, batch_size * seq_len], device=device, dtype=torch.int32),
             max_seqlen_q=seq_len,
-            cu_seqlens_k=torch.tensor([0, batch_size * seq_len], device=device),
+            cu_seqlens_k=torch.tensor([0, batch_size * seq_len], device=device, dtype=torch.int32),
             max_seqlen_k=seq_len,
         )
         
@@ -60,10 +59,9 @@ def simple_test():
         ctx = get_context()
         ctx.context_lens = torch.tensor([seq_len] * batch_size, device=device)
         
-        print(f"上下文信息: is_prefill={ctx.is_prefill}, cu_seqlens_q={ctx.cu_seqlens_q}, context_lens={ctx.context_lens}")
+        print(f"Context: is_prefill={ctx.is_prefill}, cu_seqlens_q={ctx.cu_seqlens_q}, context_lens={ctx.context_lens}")
         
         # Test forward pass.
-        print("开始前向传播...")
         print("Begin forward pass...")
         hidden_states = model(input_ids)
         print(f"Forward pass successful, hidden states shape: {hidden_states.shape}")

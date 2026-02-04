@@ -102,7 +102,7 @@ class Qwen3Attention(nn.Module):
             v = v.view(-1, self.num_kv_heads, self.head_dim)
         else:
             # Batched Mode
-            batch_size, seq_len, _, _ = q.shape
+            batch_size, seq_len, _ = q.shape
             # q shape: (batch_size, seq_len, q_size) -> (batch_size, seq_len, num_heads, head_dim)
             q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
             # k, v shape: (batch_size, seq_len, kv_size) -> (batch_size, seq_len, num_kv_heads, head_dim)

@@ -43,7 +43,7 @@ class LinearBase(nn.Module):
             self.bias = nn.Parameter(torch.empty(output_size))
             self.bias.weight_loader = self.weight_loader
         else:
-            register_parameter('bias', None)
+            self.register_parameter('bias', None)
 
     def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor):
         """

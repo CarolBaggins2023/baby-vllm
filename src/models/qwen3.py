@@ -125,6 +125,11 @@ class Qwen3Attention(nn.Module):
         o = self.attention(q, k, v)
         
         # ===== (4) Output Projection (Communication Happens by All Reduce) =====
+        # Merge heads.
+        # o shape: (batch_size*seq_len, num_heads, head_dim) 
+        # -> (batch_size*seq_len, num_heads*head_dim)
+        if o.dim() == 3:
+            o = o.view(o.shape[0], -1)
         # o shape: (batch_size*seq_len, hidden_size)
         o = self.out_projection(o)
         

@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 
-from layers import *
-from utils import get_context
+from babyvllm.layers import *
+from babyvllm.utils import get_context
 
 class Qwen3Attention(nn.Module):
     """

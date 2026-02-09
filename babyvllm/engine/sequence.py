@@ -12,6 +12,9 @@ class SequenceStatus(Enum):
     FINISHED = auto()
 
 class Sequence:
+    """Sequence of tokens. It also records the related cached blocks.
+    """
+    
     # shared class property
     # maximum number of tokens in a sequence
     block_size = 256

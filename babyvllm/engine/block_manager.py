@@ -5,6 +5,10 @@ import numpy as np
 from babyvllm.engine.sequence import Sequence
 
 class Block:
+    """
+    A block of token ids with fixed size, which is used to store kv cache.
+    """
+    
     def __init__(self, block_id: int):
         self.block_id = block_id
         self.token_ids = []
@@ -26,6 +30,11 @@ class Block:
         self.ref_count = 0
         
 class BlockManager:
+    """
+    Manage the blocks of token id sequences. Responsible for allocating and deallocating blocks, and 
+    maintaining the hash value to block id mapping.
+    """
+    
     def __init__(self, num_blocks: int, block_size: int):
         # The number of tokens in each block.
         self.block_size = block_size
@@ -90,7 +99,25 @@ class BlockManager:
         self.used_block_ids.add(block_id)
         return block
     
-    def allocate(self, seq: Sequence) -> None:
+    def _deallocate_block(self, block_id: int):
+        """
+        Deallocate a block with given block id. And manage the free and used block ids.
+        Args:
+            block_id: The id of block to deallocate.
+        """
+        block = self.blocks[block_id]
+        assert block.ref_count == 0, f"Block {block_id} cannot be deallocated because it is referenced by {block.ref_count} seqeuences."
+        block.token_ids = []
+        self.free_block_ids.add(block_id)
+        self.used_block_ids.remove(block_id)
+    
+    def can_allocate(self, seq: Sequence) -> bool:
+        """
+        Check whether the block manager can allocate `num_blocks` blocks for the sequence.
+        """
+        return seq.num_blocks <= len(self.free_block_ids)
+    
+    def allocate(self, seq: Sequence):
         # Initial hash value. -1 means no previous block.
         h = -1
         # The sequence needs `num_blocks` blocks to store all tokens,
@@ -135,4 +162,43 @@ class BlockManager:
             # Record which blocks are used by the sequence.
             # This information will be used to free blocks or append tokens to the block.
             seq.block_table.append(block.block_id)
+    
+    def deallocate(self, seq: Sequence):
+        # Update block information.
+        for block_id in seq.block_table:
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+        
+        # Update sequence information.
+        seq.block_table = []
+        seq.num_cached_tokens = 0
+    
+    def append(self, seq: Sequence):
+        """
+        Manage the blocks of sequence when a new token is appended to the sequence.
+        There are three cases:
+        (1) The last cache block of the sequence used to have `block_size`-1 tokens, so its hash value is -1.
+            After a token is appended, the last cache block of the sequence will have `block_size` tokens, so it will have a valid hash value
+            and its hash value should be managed in hash table.
+        (2) The last cache block of the seqeunce was already fully filled.
+            After a token is appended, the last cache block will have `block_size`+1 tokens, which is out of limit.
+            So, a new cache block is needed to store the appended token of the sequence.
+        (3) The number of tokens in the last cache block of the sequence is less than `block_size`-1.
+            After a token is appended, the last cache block is still unfully filled.
+            So, the hash value of the last cache block remains -1 and the hash mapping remains not recorded.
+        """
+        
+        block_table = seq.block_table
+        last_block = self.blocks[block_table[-1]]
+        if seq.num_tokens%self.block_size == 0:
+            h = self.compute_hash(token_ids=seq.block(seq.num_blocks-1), prefix_hash_value=-1 if len(block_table) == 1 else self.blocks[block_table[-2]].hash)
+            last_block.update(h=h, token_ids=seq.block(seq.num_blocks-1))
+            self.hash_to_block_id[h] = last_block.block_id
+        elif seq.num_tokens%self.block_size == 1:
+            appended_block = self._allocate_block(self.free_block_ids[0])
+            block_table.append(appended_block.block_id)
+        else:
+            assert last_block.hash == -1
             

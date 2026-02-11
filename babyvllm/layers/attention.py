@@ -135,6 +135,7 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         
+        # `k_cache` and `v_cache` will refer to the cache pool which is allocated in model runner.
         self.k_cache = torch.tensor([])
         self.v_cache = torch.tensor([])
         

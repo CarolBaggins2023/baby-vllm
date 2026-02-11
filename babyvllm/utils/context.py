@@ -5,7 +5,7 @@ from dataclasses import dataclass
 class Context:
     is_prefill: bool = False
     
-    # `cu_seqlens_q` is the cumulative sequence lengths of the queries.
+    # `cu_seqlens_q` is the cumulative sequence lengths, considering both cached and uncached tokens.
     # For example, suppose there are 3 sequences, with length 2, 3, and 5:
     # Sequence 0: [token 0, token 1]
     # Sequence 1: [token 2, token 3, token 4]
@@ -19,14 +19,16 @@ class Context:
     # (1) The begin index of each sequence: `cu_seqlens_q[:-1]`
     # (2) The end index of each sequence: `cu_seqlens_q[1:]`
     cu_seqlens_q: torch.Tensor|None = None
-    # `max_seqlen_q` is the maximum sequence length of the queries.
+    # `max_seqlen_q` is the maximum sequence length, considering both cached and uncached tokens.
     # For example, in the above example, the longest sequence is Sequence 2, with length 5,
     # so `max_seqlen_q` is 5.
     max_seqlen_q: int = 0
-    # `cu_seqlens_k` is the cumulative sequence lengths of the keys and values.
+    # `cu_seqlens_k` is the cumulative sequence lengths, considering only uncached tokens.
     # It has the same data structure as `cu_seqlens_q`.
+    # In above example, suppose token 2 in Sequence 1 is cached, and token 5 and token 6 in Sequence 2 are cached,
+    # then `cu_seqlens_k` will be [0, 2, 4, 7].
     cu_seqlens_k: torch.Tensor|None = None
-    # `max_seqlen_k` is the maximum sequence length of the keys and values.
+    # `max_seqlen_k` is the maximum sequence length, considering only uncached tokens.
     max_seqlen_k: int = 0
     
     # `slot_mapping` maps token index to slot index in cache block. sequence <-> cache block

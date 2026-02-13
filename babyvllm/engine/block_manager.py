@@ -175,6 +175,15 @@ class BlockManager:
         seq.block_table = []
         seq.num_cached_tokens = 0
     
+    def can_append(self, seq: Sequence) -> bool:
+        """ Whether we can append a new token to the sequence. """
+        
+        # If the sequence requires a new cache block, we need to check whether there are free blocks.
+        if seq.num_tokens%self.block_size == 0:
+            return len(self.free_block_ids) > 0
+        # Otherwise, we can append a token to the sequence.
+        return True
+    
     def append(self, seq: Sequence):
         """
         Manage the blocks of sequence when a new token is appended to the sequence.

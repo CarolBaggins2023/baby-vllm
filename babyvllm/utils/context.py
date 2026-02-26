@@ -71,6 +71,9 @@ def set_context(
     max_seqlen_q = 0,
     cu_seqlens_k = None,
     max_seqlen_k = 0,
+    slot_mappings=None,
+    block_tables=None,
+    context_lens=None,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -78,5 +81,8 @@ def set_context(
         cu_seqlens_q,
         max_seqlen_q,
         cu_seqlens_k,
-        max_seqlen_k
+        max_seqlen_k,
+        slot_mappings,
+        block_tables,
+        context_lens,
     )

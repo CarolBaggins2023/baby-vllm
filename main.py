@@ -32,13 +32,10 @@ config = {
     'eos': 151642,
 }
 
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
-
 def main():
-    path = os.path.expanduser('~/huggingface/Qwen3-0.6B/')
-    model_name = 'Qwen/Qwen3-0.6B'
-    tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=path)
-    llm = LLMEngine()
+    model_path = "/root/autodl-tmp/Qwen/Qwen3-0.6B"
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    llm = LLMEngine(config=config)
     
     sampling_params = SamplingParams(
         temperature=0.6,

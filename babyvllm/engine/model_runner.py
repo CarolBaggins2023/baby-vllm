@@ -61,7 +61,8 @@ class ModelRunner:
         # Get peak memory usage, which is helpful for kv cache allocation.
         self.warmup_model()
         # Allocate kv cache.
-        self.default_dtype = torch.get_default_dtype()
+        # TODO: To supprot flash attention, set data dtype to fp16 or bf16.
+        self.default_dtype = torch.bfloat16
         torch.set_default_dtype(self.default_dtype)
         self.allocate_kv_cache()
         
@@ -193,7 +194,7 @@ class ModelRunner:
         torch.cuda.reset_peak_memory_stats()
         
         # Create a batch of fake sequences and run the model.
-        max_tokens = self.config['max_tokens']
+        max_tokens = self.config['max_num_batched_tokens']
         max_model_length = self.config['max_model_length']
         batch_size = max_tokens // max_model_length
         seqs = [Sequence(token_ids=[0]*max_model_length) for _ in range(batch_size)]
@@ -329,7 +330,9 @@ class ModelRunner:
         for seq in seqs:
             token_ids = seq.token_ids
             num_cached_tokens = seq.num_cached_tokens
-            input_ids.extend([token_ids[num_cached_tokens:]])
+            # Combining seperate sequences into a long sequence,
+            # which enables efficient processing with variable length sequences.
+            input_ids.extend(token_ids[num_cached_tokens:])
             seqlens_q.append(len(token_ids)-num_cached_tokens)
             seqlens_k.append(len(token_ids))
             cu_seqlens_q.append(cu_seqlens_q[-1]+seqlens_q[-1])

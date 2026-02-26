@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from utils.context import get_context
+from babyvllm.utils import get_context
 
 
 class VocabParallelEmbedding(nn.Module):

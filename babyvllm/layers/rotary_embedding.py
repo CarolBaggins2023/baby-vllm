@@ -23,8 +23,8 @@ def apply_rotary_pos_embedding(
         x1, x2 = x.chunk(2, dim=-1)
         # For broadcasting, expand cos and sin to (total_tokens, head_dim//2).
         # cos, sin shape: (total_tokens, 1, head_dim//2)
-        cos = cos.unsqueeze(-1)
-        sin = sin.unsqueeze(-1)
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
         
         # Apply rotary embedding to x1 and x2.
         # out1, out2 shape: (total_tokens, num_heads, head_dim//2)

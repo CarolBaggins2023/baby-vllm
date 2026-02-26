@@ -32,6 +32,8 @@ config = {
     'eos': 151642,
 }
 
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
 def main():
     path = os.path.expanduser('~/huggingface/Qwen3-0.6B/')
     model_name = 'Qwen/Qwen3-0.6B'
@@ -45,9 +47,9 @@ def main():
     )
     
     prompts = [
-        "Introduce yourself."*5,
-        "List all prime numbers within 100."*5,
-    ]*5
+        "Introduce yourself.",
+        "List all prime numbers within 100.",
+    ]
     prompts = [
         tokenizer.apply_chat_template(
             [{'role': 'user', 'context': prompt}],

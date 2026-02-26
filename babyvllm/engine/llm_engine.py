@@ -106,7 +106,7 @@ class LLMEngine:
             outputs, num_processed_tokens, is_prefill = self.step()
             end_time = time.time()
             running_time = end_time-start_time+1e-10
-            print_log = f"number of processed tokens: {num_processed_tokens}, token/sec during {"prefilling" if is_prefill else "decoding"}: {num_processed_tokens/running_time}"
+            print_log = f"number of processed tokens: {num_processed_tokens}, token/sec during {'prefilling' if is_prefill else 'decoding'}: {num_processed_tokens/running_time}"
             print(print_log)
             generated_tokens.update({seq_id : tokens for seq_id, tokens in outputs})
 

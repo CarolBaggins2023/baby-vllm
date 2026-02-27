@@ -110,7 +110,7 @@ class Scheduler:
             # (2) The number of completion tokens exceeds the limit.
             stop_check_max_completion = 1+seq.num_completion_tokens >= seq.max_tokens
             # (3) The sequence length exceeds the maximum model length.
-            stop_check_max_model_len = seq.max_model_length is not None and len(seq) >= seq.model_max_tokens
+            stop_check_max_model_len = seq.max_model_length is not None and len(seq) >= seq.max_model_length
             
             if stop_check_eos or stop_check_max_completion or stop_check_max_model_len:
                 seq.status = SequenceStatus.FINISHED

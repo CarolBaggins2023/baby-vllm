@@ -99,6 +99,8 @@ class RotaryEmbedding(nn.Module):
         cos_sin = self.cos_sin_cache[positions]
         # cos, sin shape: (seq_len, rotary_dim//2) or (total_tokens, rotary_dim//2)
         cos, sin = cos_sin.chunk(2, dim=-1)
+        cos = cos.to(query.dtype)
+        sin = sin.to(query.dtype)
         # query, key shape: (seq_len, num_heads, head_dim) or (total_tokens, num_heads, head_dim)
         query = apply_rotary_pos_embedding(query, cos, sin)
         key = apply_rotary_pos_embedding(key, cos, sin)

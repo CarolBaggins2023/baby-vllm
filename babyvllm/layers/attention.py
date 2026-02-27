@@ -171,7 +171,7 @@ class Attention(nn.Module):
         else:
             o = flash_attn_with_kvcache(
                 q.unsqueeze(1), k_cache, v_cache,
-                cache_seqlens=context.seq_lens, block_table=context.block_tables,
+                cache_seqlens=context.context_lens, block_table=context.block_tables,
                 softmax_scale=self.scale, causal=True
             )
         return o

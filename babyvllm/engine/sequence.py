@@ -49,7 +49,7 @@ class Sequence:
         return self.token_ids[idx]
     
     @property
-    def if_finished(self):
+    def is_finished(self):
         return self.status == SequenceStatus.FINISHED
     
     @property

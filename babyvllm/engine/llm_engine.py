@@ -67,7 +67,7 @@ class LLMEngine:
     def add_request(self, prompt: str, sampling_params: SamplingParams):
         """ Add input prompt to the scheduler's waiting queue. """
         
-        self.scheduler.add_sequence(Sequence(prompt, sampling_params))
+        self.scheduler.add_sequence(Sequence(token_ids=self.tokenizer.encode(prompt), sampling_params=sampling_params))
 
     def step(self) -> tuple[list[int], int, bool]:
         """ Run the model for scheduled sequences. """
@@ -85,7 +85,7 @@ class LLMEngine:
         self.scheduler.postprocess(scheduled_sequences, outputs)
         
         # (4) Collect finished sequences.
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in scheduled_sequences if seq.is_finished()]
+        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in scheduled_sequences if seq.is_finished]
         num_processed_tokens = sum(len(seq) for seq in scheduled_sequences) if is_prefill else len(scheduled_sequences)
         
         return outputs, num_processed_tokens, is_prefill

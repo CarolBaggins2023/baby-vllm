@@ -39,6 +39,10 @@ class ModelRunner:
         torch.cuda.set_device(rank)
         torch.set_default_device(f'cuda:{rank}')
         
+        # TODO: To supprot flash attention, set data dtype to fp16 or bf16.
+        self.default_dtype = torch.bfloat16
+        torch.set_default_dtype(self.default_dtype)
+        
         # Create model and sampler.
         self.model = Qwen3ForCausalLM(
             vocab_size=config['vocab_size'],
@@ -61,9 +65,6 @@ class ModelRunner:
         # Get peak memory usage, which is helpful for kv cache allocation.
         self.warmup_model()
         # Allocate kv cache.
-        # TODO: To supprot flash attention, set data dtype to fp16 or bf16.
-        self.default_dtype = torch.bfloat16
-        torch.set_default_dtype(self.default_dtype)
         self.allocate_kv_cache()
         
         # Capture CUDA graph for decoding.
@@ -194,9 +195,9 @@ class ModelRunner:
         torch.cuda.reset_peak_memory_stats()
         
         # Create a batch of fake sequences and run the model.
-        max_tokens = self.config['max_num_batched_tokens']
+        max_num_batched_tokens = self.config['max_num_batched_tokens']
         max_model_length = self.config['max_model_length']
-        batch_size = max_tokens // max_model_length
+        batch_size = min(max_num_batched_tokens//max_model_length, self.config['max_num_sequences'])
         seqs = [Sequence(token_ids=[0]*max_model_length) for _ in range(batch_size)]
         self.run(seqs=seqs, is_prefill=True)
         torch.cuda.empty_cache()
@@ -245,9 +246,9 @@ class ModelRunner:
         
         # Create fake inputs for capturing CUDA graph with maximum batch size and maximum sequence length.
         # In decode phase, input is a single token id for each sequence, so the shape is always (batch_size,).
-        input_ids = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
-        slot_mapping = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
-        context_lens = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
+        input_ids = torch.zeros(max_bs, dtype=torch.int64, device=f'cuda:{self.rank}')
+        slot_mapping = torch.zeros(max_bs, dtype=torch.int32, device=f'cuda:{self.rank}')
+        context_lens = torch.zeros(max_bs, dtype=torch.int32, device=f'cuda:{self.rank}')
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=f'cuda:{self.rank}')
         outputs = torch.zeros(max_bs, self.config['vocab_size'], device=f'cuda:{self.rank}')
         
@@ -343,7 +344,7 @@ class ModelRunner:
                     if seq.num_cached_blocks+i != seq.num_blocks-1:
                         slot_mappings.extend(list(range(block_id*self.block_size, (block_id+1)*self.block_size)))
                     else:
-                        slot_mappings.extend(list(range(block_id*self.block_size, seq.last_block_num_tokens)))
+                        slot_mappings.extend(list(range(block_id*self.block_size, block_id*self.block_size+seq.last_block_num_tokens)))
 
         # The block table will be passed to Triton kernel. And Triton kernel requires all sequences have same number of blocks.
         if cu_seqlens_q[-1] < cu_seqlens_k[-1]:
@@ -354,7 +355,7 @@ class ModelRunner:
                 block_tables.append(aligned_block_table)
         
         # Allocate input token ids to pinned memory buffer, accelerating data transfer between host and device.
-        input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         
         set_context(
             is_prefill=True,
@@ -362,7 +363,7 @@ class ModelRunner:
             cu_seqlens_k=torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             max_seqlen_q=max(seqlens_q),
             max_seqlen_k=max(seqlens_k),
-            slot_mappings=torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
+            slot_mappings=torch.tensor(slot_mappings, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
             context_lens=None,
         )
@@ -390,7 +391,7 @@ class ModelRunner:
             aligned_block_table = seq.block_table+[-1]*(max_num_blocks-len(seq.block_table))
             block_tables.append(aligned_block_table)
 
-        input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         
         set_context(
             is_prefill=False,
@@ -398,9 +399,9 @@ class ModelRunner:
             cu_seqlens_k=None,
             max_seqlen_q=0,
             max_seqlen_k=0,
-            slot_mappings=torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
+            slot_mappings=torch.tensor(slot_mappings, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
-            context_lens=torch.tensor(context_lens, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
+            context_lens=torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
         )
         
         return input_ids

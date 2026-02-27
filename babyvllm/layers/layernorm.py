@@ -7,7 +7,6 @@ class LayerNorm(nn.Module):
     LayerNorm with optional residual connection.
     """
     
-    @torch.compile
     def __init__(self, gamma: torch.Tensor, eps: float = 1e-5):
         """
         Args:

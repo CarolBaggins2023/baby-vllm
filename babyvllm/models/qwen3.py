@@ -35,20 +35,22 @@ class Qwen3Attention(nn.Module):
         self.total_num_kv_heads = num_kv_heads if num_kv_heads is not None else self.total_num_heads
         self.num_kv_heads = self.total_num_kv_heads//self.tp_size
         
-        self.head_dim = head_dim if head_dim is not None else hidden_size//self.tp_size
+        self.head_dim = head_dim if head_dim is not None else hidden_size//num_heads
         self.q_size = self.head_dim*self.num_heads
         self.kv_size = self.head_dim*self.num_kv_heads
         self.qkv_bias = qkv_bias
         
-        self.qkv_projection = QKVColumnParallelLinear(
-            input_size=self.head_dim*self.total_num_heads,
+        self.qkv_proj = QKVColumnParallelLinear(
+            input_size=hidden_size,
             head_size=self.head_dim,
             num_heads=self.total_num_heads,
             num_kv_heads=self.total_num_kv_heads,
             bias=qkv_bias,
         )
         
-        self.rms_norm = LayerNorm(torch.ones(head_dim))
+        if not self.qkv_bias:
+            self.q_norm = RMSNorm(self.head_dim, rms_norm_epsilon)
+            self.k_norm = RMSNorm(self.head_dim, rms_norm_epsilon)
         
         self.rotary_emb = RotaryEmbedding(
             base=base,
@@ -63,7 +65,7 @@ class Qwen3Attention(nn.Module):
             num_kv_heads=self.num_kv_heads,
         )
         
-        self.out_projection = RowParallelLinear(
+        self.o_proj = RowParallelLinear(
             input_size=self.head_dim*self.total_num_heads,
             output_size=hidden_size,
             bias=qkv_bias,
@@ -86,7 +88,7 @@ class Qwen3Attention(nn.Module):
         # ===== (1) QKV Projection and Split (Sharding Happens) =====
         # `QKVColumnParallelLinear` returns the shard of qkv.
         # qkv shape: (batch_size, seq_len, head_dim*(num_heads+2*num_kv_heads))
-        qkv = self.qkv_projection(x)
+        qkv = self.qkv_proj(x)
         
         # Split qkv into q, k, and v, according to their sizes.
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -114,8 +116,8 @@ class Qwen3Attention(nn.Module):
         # So, if there is big number in q.dot(k), the softmax will be nan.
         # To avoid this, we normalize q and k.
         if self.qkv_bias is False:
-            q = self.rms_norm(q)
-            k = self.rms_norm(k)
+            q = self.q_norm(q)
+            k = self.k_norm(k)
         
         # Apply rotary embedding to q and k.
         q, k = self.rotary_emb(positions, q, k)
@@ -135,7 +137,7 @@ class Qwen3Attention(nn.Module):
         # (batch_size*seq_len, num_heads*head_dim)
         o = o.view(o.shape[0], -1)
         # o shape: (batch_size*seq_len, hidden_size)
-        o = self.out_projection(o)
+        o = self.o_proj(o)
         
         return o
 
@@ -195,8 +197,7 @@ class Qwen3DecoderLayer(nn.Module):
     ):
         super().__init__()
         
-        gemma = torch.ones(hidden_size)
-        self.input_layernorm = LayerNorm(gamma=gemma)
+        self.input_layernorm = RMSNorm(hidden_size, rms_norm_epsilon)
         self.self_attn = Qwen3Attention(
             hidden_size=hidden_size,
             num_heads=num_heads,
@@ -208,7 +209,7 @@ class Qwen3DecoderLayer(nn.Module):
             base=base,
             max_position=max_position,
         )
-        self.post_attn_layernorm = LayerNorm(gamma=gemma)
+        self.post_attention_layernorm = RMSNorm(hidden_size, rms_norm_epsilon)
         self.mlp = Qwen3MLP(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -253,7 +254,7 @@ class Qwen3DecoderLayer(nn.Module):
         x = self.self_attn(x, positions)
         
         # (3) Post-Attention LayerNorm
-        x, residual = self.post_attn_layernorm(x, residual)
+        x, residual = self.post_attention_layernorm(x, residual)
         
         # (4) MLP
         x = self.mlp(x)
@@ -285,11 +286,11 @@ class Qwen3Model(nn.Module):
     ):
         super().__init__()
         
-        self.embedding_layer = VocabParallelEmbedding(
+        self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=vocab_size,
             embedding_dim=hidden_size,
         )
-        self.layer_stack = nn.ModuleList([
+        self.layers = nn.ModuleList([
             Qwen3DecoderLayer(
                 hidden_size=hidden_size,
                 num_heads=num_heads,
@@ -304,23 +305,31 @@ class Qwen3Model(nn.Module):
                 ffn_bias=ffn_bias,
             ) for _ in range(num_layers)
         ])
-        self.final_layernorm = LayerNorm(gamma=torch.ones(hidden_size))
+        self.norm = RMSNorm(hidden_size, rms_norm_epsilon)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # (1) Embedding
-        x = self.embedding_layer(x)
+        x = self.embed_tokens(x)
         
         # (2) Multiple Self-Attention and MLP
         residual = None
-        for layer in self.layer_stack:
+        for layer in self.layers:
             x, residual = layer(x, residual)
         
         # (3) Final LayerNorm
-        x, _ = self.final_layernorm(x, residual)
+        x, _ = self.norm(x, residual)
         
         return x
 
 class Qwen3ForCausalLM(nn.Module):
+    packed_modules_mapping = {
+        "q_proj": ("qkv_proj", "q"),
+        "k_proj": ("qkv_proj", "k"),
+        "v_proj": ("qkv_proj", "v"),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+    }
+    
     def __init__(
         self,
         vocab_size: int,
@@ -340,7 +349,7 @@ class Qwen3ForCausalLM(nn.Module):
     ):
         super().__init__()
         
-        self.qwen3_model = Qwen3Model(
+        self.model = Qwen3Model(
             vocab_size=vocab_size,
             hidden_size=hidden_size,
             num_heads=num_heads,
@@ -362,10 +371,10 @@ class Qwen3ForCausalLM(nn.Module):
         )
         
         if tie_word_embeddings:
-            self.lm_head.weight = self.qwen3_model.embedding_layer.weight
+            self.lm_head.weight = self.model.embed_tokens.weight
     
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        x = self.qwen3_model(input_ids)
+        x = self.model(input_ids)
         return x
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:

@@ -20,7 +20,7 @@ def main():
         'vocab_size': max(tokenizer.vocab_size, model_config.vocab_size),
         'hidden_size': model_config.hidden_size,
         'num_heads': model_config.num_attention_heads,
-        'head_dim': model_config.hidden_size // model_config.num_attention_heads,
+        'head_dim': model_config.head_dim,
         'num_kv_heads': model_config.num_key_value_heads,
         'intermediate_size': model_config.intermediate_size,
         'num_layers': model_config.num_hidden_layers,

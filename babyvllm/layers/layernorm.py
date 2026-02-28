@@ -2,25 +2,25 @@ import torch
 import torch.nn as nn
 import time
 
-class LayerNorm(nn.Module):
+class RMSNorm(nn.Module):
     """
-    LayerNorm with optional residual connection.
+    RMSNorm with optional residual connection.
     """
     
-    def __init__(self, gamma: torch.Tensor, eps: float = 1e-5):
+    def __init__(self, hidden_size: int, eps: float = 1e-5):
         """
         Args:
             gamma: The scale parameter.
             eps: The epsilon value to avoid division by zero. Defaults to 1e-5.
         """
         super().__init__()
-        self.register_buffer("gamma", gamma)
+        self.weight = nn.Parameter(torch.ones(hidden_size))
         self.eps = eps
     
     @torch.compile
     def rms_forward(self, x: torch.Tensor) -> torch.Tensor:
         sqrt_variance = (x.pow(2).mean(dim=-1, keepdim=True)+self.eps).sqrt()
-        return x*self.gamma/sqrt_variance
+        return x*self.weight/sqrt_variance
         
     def residual_rms_forward(self, x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
         x = x+residual
@@ -40,7 +40,7 @@ if __name__ == "__main__":
         input_tensor = torch.randn(*shape).cuda()
         residual = torch.full_like(input_tensor, fill_value=1)
         gamma = torch.full(shape, 0.5, device="cuda", dtype=input_tensor.dtype)
-        layer = LayerNorm(gamma=gamma).cuda()
+        layer = RMSNorm(gamma=gamma).cuda()
         
         # Warmup iterations
         for _ in range(10):

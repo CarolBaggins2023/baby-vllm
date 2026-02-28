@@ -194,7 +194,7 @@ class QKVColumnParallelLinear(ColumnParallelLinear):
             offset = self.head_size*self.num_heads
             shard_size = self.head_size*self.num_kv_heads
         else:
-            offset = self.head_size*self.num_heads+self.head_size*self.num_heads
+            offset = self.head_size*self.num_heads+self.head_size*self.num_kv_heads
             shard_size = self.head_size*self.num_kv_heads
         
         # Copy the shard corresponding to the current GPU to the parameter data.
@@ -226,7 +226,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         loaded_weight_id: int,
     ):
         """
-        Load the weight from the checkpoint.
+        Load the weight from checkpoint to the shard of parameter.
         Args:
             param: The parameter to load the weight to.
             loaded_weights: The weight to load.
@@ -244,6 +244,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             output_sizes=sum([intermediate_size, intermediate_size]), # gate and up
         )
         """
+        # Load loaded_weights[loaded_weights_start_idx : loaded_weights_start_idx+shard_size, :] to param.data[offset : offset+shard_size, :]
         param_data = param.data
         offset = sum(self.output_sizes[:loaded_weight_id])//self.tp_size
         shard_size = self.output_sizes[loaded_weight_id]//self.tp_size

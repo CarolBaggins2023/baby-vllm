@@ -9,6 +9,7 @@ from babyvllm.models.qwen3 import Qwen3ForCausalLM
 from babyvllm.layers.sampler import Sampler
 from babyvllm.engine.sequence import Sequence
 from babyvllm.utils.context import set_context, reset_context, get_context
+from babyvllm.utils.loader import load_model
 
 class ModelRunner:
     """
@@ -60,6 +61,7 @@ class ModelRunner:
             num_layers=config['num_layers'],
             tie_word_embeddings=config['tie_word_embeddings'],
         ).cuda(rank)
+        load_model(self.model, config['model_name_or_path'])
         self.sampler = Sampler()
         
         # Get peak memory usage, which is helpful for kv cache allocation.

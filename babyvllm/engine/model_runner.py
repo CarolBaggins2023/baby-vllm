@@ -40,8 +40,7 @@ class ModelRunner:
         torch.cuda.set_device(rank)
         torch.set_default_device(f'cuda:{rank}')
         
-        # TODO: To supprot flash attention, set data dtype to fp16 or bf16.
-        self.default_dtype = torch.bfloat16
+        self.default_dtype = config['dtype']
         torch.set_default_dtype(self.default_dtype)
         
         # Create model and sampler.
@@ -50,14 +49,12 @@ class ModelRunner:
             hidden_size=config['hidden_size'],
             num_heads=config['num_heads'],
             head_dim=config['head_dim'],
-            scale=config['scale'],
             num_kv_heads=config['num_kv_heads'],
             rms_norm_epsilon=config['rms_norm_epsilon'],
             qkv_bias=config['qkv_bias'],
             base=config['base'],
             max_position=config['max_position'],
             intermediate_size=config['intermediate_size'],
-            ffn_bias=config['ffn_bias'],
             num_layers=config['num_layers'],
             tie_word_embeddings=config['tie_word_embeddings'],
         ).cuda(rank)
@@ -242,7 +239,7 @@ class ModelRunner:
     
     @torch.inference_mode()
     def capture_cudagraph(self):
-        max_bs = self.config['max_num_seqs']
+        max_bs = self.config['max_num_sequences']
         max_len = self.config['max_model_length']
         max_num_blocks = math.ceil(max_len/self.block_size)
         
@@ -417,6 +414,7 @@ class ModelRunner:
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
     
+    @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, is_prefill: bool):
         """
         Run model inference for a batch of sequences and return logits.
@@ -455,6 +453,7 @@ class ModelRunner:
         
         return logits
     
+    @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         """ Run model inference for a batch of sequences and return output token ids. """
         

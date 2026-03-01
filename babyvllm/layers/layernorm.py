@@ -10,7 +10,6 @@ class RMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-5):
         """
         Args:
-            gamma: The scale parameter.
             eps: The epsilon value to avoid division by zero. Defaults to 1e-5.
         """
         super().__init__()
@@ -19,12 +18,22 @@ class RMSNorm(nn.Module):
     
     @torch.compile
     def rms_forward(self, x: torch.Tensor) -> torch.Tensor:
-        sqrt_variance = (x.pow(2).mean(dim=-1, keepdim=True)+self.eps).sqrt()
-        return x*self.weight/sqrt_variance
-        
+        orig_dtype = x.dtype
+        x = x.float()
+        var = x.pow(2).mean(dim=-1, keepdim=True)
+        x.mul_(torch.rsqrt(var+self.eps))
+        x = x.to(orig_dtype).mul_(self.weight)
+        return x
+    
+    @torch.compile
     def residual_rms_forward(self, x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
-        x = x+residual
-        return self.rms_forward(x), x    
+        orig_dtype = x.dtype
+        x = x.float().add_(residual.float())
+        residual = x.to(orig_dtype)
+        var = x.pow(2).mean(dim=-1, keepdim=True)
+        x.mul_(torch.rsqrt(var + self.eps))
+        x = x.to(orig_dtype).mul_(self.weight)
+        return x, residual
         
     def forward(self, x: torch.Tensor, residual: torch.Tensor|None = None) -> torch.Tensor:
         if residual is not None:

@@ -20,7 +20,8 @@ def apply_rotary_pos_embedding(
         # x shape: (total_tokens, num_heads, head_dim)
         total_tokens, num_heads, head_dim = x.shape
         # x1, x2 shape: (total_tokens, num_heads, head_dim//2)
-        x1, x2 = x.chunk(2, dim=-1)
+        # Convert input to float32 to avoid precision issues.
+        x1, x2 = torch.chunk(x.float(), 2, dim=-1)
         # For broadcasting, expand cos and sin to (total_tokens, head_dim//2).
         # cos, sin shape: (total_tokens, 1, head_dim//2)
         cos = cos.unsqueeze(1)
@@ -31,7 +32,8 @@ def apply_rotary_pos_embedding(
         out1 = x1*cos-x2*sin
         out2 = x1*sin+x2*cos
         
-        return torch.cat([out1, out2], dim=-1)
+        # Convert back to fp16 or bf16 dtype to adapt to flashattn.
+        return torch.cat([out1, out2], dim=-1).to(x.dtype)
     elif x.dim() == 4:
         # x shape: (batch_size, seq_len, num_heads, head_dim)
         batch_size, seq_len, num_heads, head_dim = x.shape
@@ -99,8 +101,6 @@ class RotaryEmbedding(nn.Module):
         cos_sin = self.cos_sin_cache[positions]
         # cos, sin shape: (seq_len, rotary_dim//2) or (total_tokens, rotary_dim//2)
         cos, sin = cos_sin.chunk(2, dim=-1)
-        cos = cos.to(query.dtype)
-        sin = sin.to(query.dtype)
         # query, key shape: (seq_len, num_heads, head_dim) or (total_tokens, num_heads, head_dim)
         query = apply_rotary_pos_embedding(query, cos, sin)
         key = apply_rotary_pos_embedding(key, cos, sin)

@@ -1,5 +1,6 @@
 import os
 from transformers import AutoTokenizer, AutoConfig
+import time
 
 from babyvllm.sampling_params import SamplingParams
 from babyvllm.engine.llm_engine import LLMEngine
@@ -25,15 +26,14 @@ def main():
         'intermediate_size': model_config.intermediate_size,
         'num_layers': model_config.num_hidden_layers,
         'tie_word_embeddings': model_config.tie_word_embeddings if hasattr(model_config, 'tie_word_embeddings') else True,
-        'base': 10000,
+        'base': model_config.rope_parameters['rope_theta'],
         'rms_norm_epsilon': model_config.rms_norm_eps,
-        'qkv_bias': False,
-        'scale': 1,
+        'qkv_bias': model_config.attention_bias,
         'max_position': model_config.max_position_embeddings,
-        'ffn_bias': True,
         'max_model_length': min(4096, model_config.max_position_embeddings),
         'gpu_memory_utilization': 0.9,
         'eos': tokenizer.eos_token_id if tokenizer.eos_token_id is not None else model_config.eos_token_id,
+        "dtype": model_config.dtype,
     }
     
     llm = LLMEngine(config=config)
@@ -47,7 +47,7 @@ def main():
     prompts = [
         "Introduce yourself.",
         "List all prime numbers within 100.",
-    ]
+    ]*10
     prompts = [
         tokenizer.apply_chat_template(
             [{'role': 'user', 'content': prompt}],
@@ -56,12 +56,16 @@ def main():
         ) for prompt in prompts
     ]
     
+    start_time = time.time()
     outputs = llm.generate(prompts, sampling_params)
+    end_time = time.time()
     
-    for prompt, output in zip(prompts, outputs['text']):
+    for prompt, output in zip(prompts, outputs):
         print("\n")
         print(f"Prompt: {prompt!r}")
-        print(f"Completion: {output!r}")
+        print(f"Completion: {output['text']!r}")
+
+    print(f"total time: {end_time-start_time}")
 
 if __name__ == '__main__':
     main()

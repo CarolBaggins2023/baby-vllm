@@ -113,5 +113,5 @@ class LLMEngine:
         # Sort generated tokens by sequence id. So, the output text are in the same order as user input.
         generated_tokens = [generated_tokens[seq_id] for seq_id in sorted(generated_tokens.keys())]
         
-        output = {'text':[self.tokenizer.decode(tokens) for tokens in generated_tokens], 'token_ids':generated_tokens}
-        return output
+        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in generated_tokens]
+        return outputs

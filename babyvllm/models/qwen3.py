@@ -18,7 +18,6 @@ class Qwen3Attention(nn.Module):
         hidden_size: int,
         num_heads: int,
         head_dim: int|None = None,
-        scale: float = 1.0,
         num_kv_heads: int|None = None,
         rms_norm_epsilon: float = 1e-5,
         qkv_bias: bool = False,
@@ -39,6 +38,8 @@ class Qwen3Attention(nn.Module):
         self.q_size = self.head_dim*self.num_heads
         self.kv_size = self.head_dim*self.num_kv_heads
         self.qkv_bias = qkv_bias
+        
+        self.scale = self.head_dim**-0.5
         
         self.qkv_proj = QKVColumnParallelLinear(
             input_size=hidden_size,
@@ -61,7 +62,7 @@ class Qwen3Attention(nn.Module):
         self.attention = Attention(
             num_heads=self.num_heads,
             head_dim=self.head_dim,
-            scale=scale,
+            scale=self.scale,
             num_kv_heads=self.num_kv_heads,
         )
         
@@ -152,19 +153,18 @@ class Qwen3MLP(nn.Module):
         self,
         hidden_size: int,
         intermediate_size: int,
-        bias: bool = True,
     ):
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=hidden_size,
             output_sizes=[intermediate_size]*2,
-            bias=bias,
+            bias=False,
         )
         self.activation = SiluAndMul()
         self.down_proj = RowParallelLinear(
             input_size=intermediate_size,
             output_size=hidden_size,
-            bias=bias,
+            bias=False,
         )
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -186,14 +186,12 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_size: int,
         num_heads: int,
         head_dim: int|None = None,
-        scale: float = 1.0,
         num_kv_heads: int|None = None,
         rms_norm_epsilon: float = 1e-5,
         qkv_bias: bool = False,
         base: int = 10000,
         max_position: int = 16384,
         intermediate_size: int = 4*1024,
-        ffn_bias: bool = True,
     ):
         super().__init__()
         
@@ -202,7 +200,6 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_size=hidden_size,
             num_heads=num_heads,
             head_dim=head_dim,
-            scale=scale,
             num_kv_heads=num_kv_heads,
             rms_norm_epsilon=rms_norm_epsilon,
             qkv_bias=qkv_bias,
@@ -213,7 +210,6 @@ class Qwen3DecoderLayer(nn.Module):
         self.mlp = Qwen3MLP(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            bias=ffn_bias,
         )
     
     def forward(self, x: torch.Tensor, residual: torch.Tensor|None = None) -> torch.Tensor:
@@ -223,8 +219,7 @@ class Qwen3DecoderLayer(nn.Module):
         if residual is not None:
             x, residual = self.input_layernorm(x, residual)
         else:
-            x = self.input_layernorm(x)
-            residual = x
+            x, residual = self.input_layernorm(x), x
             
         # (2) Calculate Positions and Self-Attention
         context = get_context()
@@ -274,14 +269,12 @@ class Qwen3Model(nn.Module):
         hidden_size: int,
         num_heads: int,
         head_dim: int|None = None,
-        scale: float = 1.0,
         num_kv_heads: int|None = None,
         rms_norm_epsilon: float = 1e-5,
         qkv_bias: bool = False,
         base: int = 10000,
         max_position: int = 16384,
         intermediate_size: int = 4*1024,
-        ffn_bias: bool = True,
         num_layers: int = 12,
     ):
         super().__init__()
@@ -295,14 +288,12 @@ class Qwen3Model(nn.Module):
                 hidden_size=hidden_size,
                 num_heads=num_heads,
                 head_dim=head_dim,
-                scale=scale,
                 num_kv_heads=num_kv_heads,
                 rms_norm_epsilon=rms_norm_epsilon,
                 qkv_bias=qkv_bias,
                 base=base,
                 max_position=max_position,
                 intermediate_size=intermediate_size,
-                ffn_bias=ffn_bias,
             ) for _ in range(num_layers)
         ])
         self.norm = RMSNorm(hidden_size, rms_norm_epsilon)
@@ -336,14 +327,12 @@ class Qwen3ForCausalLM(nn.Module):
         hidden_size: int,
         num_heads: int,
         head_dim: int|None = None,
-        scale: float = 1.0,
         num_kv_heads: int|None = None,
         rms_norm_epsilon: float = 1e-5,
         qkv_bias: bool = False,
         base: int = 10000,
         max_position: int = 16384,
         intermediate_size: int = 4*1024,
-        ffn_bias: bool = True,
         num_layers: int = 12,
         tie_word_embeddings: bool = False, # Whether to tie the word embeddings and the LM head.
     ):
@@ -354,14 +343,12 @@ class Qwen3ForCausalLM(nn.Module):
             hidden_size=hidden_size,
             num_heads=num_heads,
             head_dim=head_dim,
-            scale=scale,
             num_kv_heads=num_kv_heads,
             rms_norm_epsilon=rms_norm_epsilon,
             qkv_bias=qkv_bias,
             base=base,
             max_position=max_position,
             intermediate_size=intermediate_size,
-            ffn_bias=ffn_bias,
             num_layers=num_layers,
         )
         

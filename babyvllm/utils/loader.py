@@ -25,6 +25,5 @@ def load_model(model: nn.Module, model_path: str):
                 else:
                     param = model.get_parameter(weight_name)
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    param.data.copy_(f.get_tensor(weight_name))
-                    # weight_loader(param, f.get_tensor(weight_name))
+                    weight_loader(param, f.get_tensor(weight_name))
         

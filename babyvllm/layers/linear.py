@@ -18,7 +18,7 @@ class LinearBase(nn.Module):
         self,
         input_size: int,
         output_size: int,
-        bias: bool = True,
+        bias: bool = False,
         tp_dim: int|None = None,
     ):
         """
@@ -84,7 +84,7 @@ class ReplicatedLinear(LinearBase):
         self,
         input_size: int,
         output_size: int,
-        bias: bool = True,
+        bias: bool = False,
     ):
         """
         Args:
@@ -109,7 +109,7 @@ class ColumnParallelLinear(LinearBase):
         self,
         input_size: int,
         output_size: int,
-        bias: bool = True,
+        bias: bool = False,
     ):
         """
         Args:
@@ -208,7 +208,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         self,
         input_size: int,
         output_sizes: list[int],
-        bias: bool = True,
+        bias: bool = False,
     ):
         """
         Args:
@@ -264,7 +264,7 @@ class RowParallelLinear(LinearBase):
         self,
         input_size: int,
         output_size: int,
-        bias: bool = True,
+        bias: bool = False,
     ):
         """
         Args:

@@ -89,7 +89,12 @@ class LLMEngine:
         
         return outputs, num_processed_tokens, is_prefill
 
-    def generate(self, prompts: list[str], sampling_params: SamplingParams) -> list[str]:
+    def generate(
+        self,
+        prompts: list[str],
+        sampling_params: SamplingParams,
+        print_log: bool = False,
+    ) -> list[str]:
         """ Generate text for all input prompts. """
         
         # Add all input prompts to the scheduler's waiting queue.
@@ -104,9 +109,10 @@ class LLMEngine:
             # outputs: {sequence id : generated tokens}
             outputs, num_processed_tokens, is_prefill = self.step()
             end_time = time.time()
-            running_time = end_time-start_time+1e-10
-            print_log = f"number of processed tokens: {num_processed_tokens}, token/sec during {'prefilling' if is_prefill else 'decoding'}: {num_processed_tokens/running_time}"
-            print(print_log)
+            if print_log:
+                running_time = end_time-start_time+1e-10
+                print_log = f"number of processed tokens: {num_processed_tokens}, token/sec during {'prefilling' if is_prefill else 'decoding'}: {num_processed_tokens/running_time}"
+                print(print_log)
             generated_tokens.update({seq_id : tokens for seq_id, tokens in outputs})
 
         # Sort generated tokens by sequence id. So, the output text are in the same order as user input.

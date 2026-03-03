@@ -13,7 +13,7 @@ def main():
             profiler.ProfilerActivity.CUDA,
         ],
         record_shapes=True,
-        with_stack=False,
+        with_stack=True,
     ) as prof:
         model_name_or_path = '/root/autodl-tmp/Qwen/Qwen3-0.6B'
         tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
@@ -38,14 +38,14 @@ def main():
         outputs = llm.generate(prompts, sampling_params)
         # end_time = time.time()
         
-        for prompt, output in zip(prompts, outputs):
-            print("\n")
-            print(f"Prompt: {prompt!r}")
-            print(f"Completion: {output['text']!r}")
+        # for prompt, output in zip(prompts, outputs):
+        #     print("\n")
+        #     print(f"Prompt: {prompt!r}")
+        #     print(f"Completion: {output['text']!r}")
 
         # print(f"total time: {end_time-start_time}")
     
-    prof.export_chrome_trace("trace.json")
+    prof.export_chrome_trace("trace_baby.json")
 
 if __name__ == '__main__':
     main()

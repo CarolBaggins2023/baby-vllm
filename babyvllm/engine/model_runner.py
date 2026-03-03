@@ -5,11 +5,13 @@ import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
+from babyvllm.config import Config
 from babyvllm.models.qwen3 import Qwen3ForCausalLM
 from babyvllm.layers.sampler import Sampler
 from babyvllm.engine.sequence import Sequence
 from babyvllm.utils.context import set_context, reset_context, get_context
 from babyvllm.utils.loader import load_model
+
 
 class ModelRunner:
     """
@@ -21,7 +23,7 @@ class ModelRunner:
     (4) Shared memory communication: `read_shm`, `write_shm`.
     """
     
-    def __init__(self, config: dict, rank: int, event: Event|list[Event]):
+    def __init__(self, config: Config, rank: int, event: Event|list[Event]):
         self.config = config
         # Event is used to synchronize multi-processes.
         # For rank 0, `event` is a list of events, which size is `world_size-1`.
@@ -29,36 +31,23 @@ class ModelRunner:
         self.event = event
         
         # Set parameters for distributed inference.
-        self.world_size = config['world_size']
-        self.block_size = config['block_size']
+        self.world_size = config.tensor_parallel_size
+        self.block_size = config.kvcache_block_size
         # Whether to enforce eager execution when running model.
-        self.enforce_eager = config.get('enforce_eager', False)
+        self.enforce_eager = config.enforce_eager
         
         # Initialize distributed process group.
         self.rank = rank
-        dist.init_process_group(backend='nccl', init_method='tcp://localhost:12345', world_size=config['world_size'], rank=rank)
+        dist.init_process_group(backend='nccl', init_method='tcp://localhost:12345', world_size=config.tensor_parallel_size, rank=rank)
         torch.cuda.set_device(rank)
         torch.set_default_device(f'cuda:{rank}')
         
-        self.default_dtype = config['dtype']
+        self.default_dtype = config.hf_config.dtype
         torch.set_default_dtype(self.default_dtype)
         
         # Create model and sampler.
-        self.model = Qwen3ForCausalLM(
-            vocab_size=config['vocab_size'],
-            hidden_size=config['hidden_size'],
-            num_heads=config['num_heads'],
-            head_dim=config['head_dim'],
-            num_kv_heads=config['num_kv_heads'],
-            rms_norm_epsilon=config['rms_norm_epsilon'],
-            qkv_bias=config['qkv_bias'],
-            base=config['base'],
-            max_position=config['max_position'],
-            intermediate_size=config['intermediate_size'],
-            num_layers=config['num_layers'],
-            tie_word_embeddings=config['tie_word_embeddings'],
-        ).cuda(rank)
-        load_model(self.model, config['model_name_or_path'])
+        self.model = Qwen3ForCausalLM(config.hf_config).cuda(rank)
+        load_model(self.model, config.model)
         self.sampler = Sampler()
         
         # Get peak memory usage, which is helpful for kv cache allocation.
@@ -194,9 +183,9 @@ class ModelRunner:
         torch.cuda.reset_peak_memory_stats()
         
         # Create a batch of fake sequences and run the model.
-        max_num_batched_tokens = self.config['max_num_batched_tokens']
-        max_model_length = self.config['max_model_length']
-        batch_size = min(max_num_batched_tokens//max_model_length, self.config['max_num_sequences'])
+        max_num_batched_tokens = self.config.max_num_batched_tokens
+        max_model_length = self.config.max_model_length
+        batch_size = min(max_num_batched_tokens//max_model_length, self.config.max_num_sequences)
         seqs = [Sequence(token_ids=[0]*max_model_length) for _ in range(batch_size)]
         self.run(seqs=seqs, is_prefill=True)
         torch.cuda.empty_cache()
@@ -205,16 +194,16 @@ class ModelRunner:
         # ===== (1) Find available memory while reserving room for model execution. =====
         # Get free memory and total memory of the current device.
         free_mem, total_mem = torch.cuda.mem_get_info()
-        total_free_mem = free_mem*self.config['gpu_memory_utilization']
+        total_free_mem = free_mem*self.config.gpu_memory_utilization
         # Reserve room for model execution.
         peak_mem_usage = torch.cuda.memory_stats()['allocated_bytes.all.peak']
         current_mem_usage = torch.cuda.memory_stats()['allocated_bytes.all.current']
         available_mem = total_free_mem-(peak_mem_usage-current_mem_usage)
         
         # ===== (2) Find parameters to compute kv cache size. =====
-        num_layers = self.config['num_layers']
-        num_kv_heads = self.config['num_kv_heads']
-        head_dim = self.config['head_dim']
+        num_layers = self.config.hf_config.num_hidden_layers
+        num_kv_heads = self.config.hf_config.num_key_value_heads
+        head_dim = self.config.hf_config.head_dim
         
         # ===== (3) Compute kv cache block size and number of available blocks. =====
         # size of one kv cache block in bytes
@@ -239,8 +228,8 @@ class ModelRunner:
     
     @torch.inference_mode()
     def capture_cudagraph(self):
-        max_bs = self.config['max_num_sequences']
-        max_len = self.config['max_model_length']
+        max_bs = self.config.max_num_sequences
+        max_len = self.config.max_model_length
         max_num_blocks = math.ceil(max_len/self.block_size)
         
         # Create fake inputs for capturing CUDA graph with maximum batch size and maximum sequence length.
@@ -249,7 +238,7 @@ class ModelRunner:
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32, device=f'cuda:{self.rank}')
         context_lens = torch.zeros(max_bs, dtype=torch.int32, device=f'cuda:{self.rank}')
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=f'cuda:{self.rank}')
-        outputs = torch.zeros(max_bs, self.config['vocab_size'], device=f'cuda:{self.rank}')
+        outputs = torch.zeros(max_bs, self.config.hf_config.hidden_size, device=f'cuda:{self.rank}')
         
         # Which batch sizes we want to capture CUDA graph for.
         batch_sizes = [1, 2, 4, 8]+list(range(16,max_bs+1, 16))
@@ -283,8 +272,8 @@ class ModelRunner:
             # These information will be saved in torch.cuda.CUDAGraph object.
             with torch.cuda.graph(graph, graph_pool):
                 outputs[:batch_size] = self.model(input_ids[:batch_size])
-                if graph_pool is None:
-                    graph_pool = graph.pool()
+            if graph_pool is None:
+                graph_pool = graph.pool()
             self.graphs[batch_size] = graph
             
             # Make sure the capture is done before moving to the next capture.
@@ -307,7 +296,7 @@ class ModelRunner:
         input_ids = []
         # Where the cache of each uncached token should be written to.
         # shape: (sum of number of uncached tokens,)
-        slot_mappings = []
+        slot_mapping = []
         
         # Number of all tokens in each sequence, considering both cached and uncached tokens.
         # shape: (number of sequences,)
@@ -341,9 +330,9 @@ class ModelRunner:
                 for i, block_id in enumerate(seq.block_table[seq.num_cached_blocks:]):
                     # Check if the block is the last block of the sequence.
                     if seq.num_cached_blocks+i != seq.num_blocks-1:
-                        slot_mappings.extend(list(range(block_id*self.block_size, (block_id+1)*self.block_size)))
+                        slot_mapping.extend(list(range(block_id*self.block_size, (block_id+1)*self.block_size)))
                     else:
-                        slot_mappings.extend(list(range(block_id*self.block_size, block_id*self.block_size+seq.last_block_num_tokens)))
+                        slot_mapping.extend(list(range(block_id*self.block_size, block_id*self.block_size+seq.last_block_num_tokens)))
 
         # The block table will be passed to Triton kernel. And Triton kernel requires all sequences have same number of blocks.
         if cu_seqlens_q[-1] < cu_seqlens_k[-1]:
@@ -362,7 +351,7 @@ class ModelRunner:
             cu_seqlens_k=torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             max_seqlen_q=max(seqlens_q),
             max_seqlen_k=max(seqlens_k),
-            slot_mappings=torch.tensor(slot_mappings, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            slot_mapping=torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
             context_lens=None,
         )
@@ -373,7 +362,7 @@ class ModelRunner:
         """ Prepare the data for decode forward pass. One token per sequence. """
         
         input_ids = []
-        slot_mappings = []
+        slot_mapping = []
         block_tables = []
         # Number of handled tokens in each sequence.
         # shape: (number of sequences,)
@@ -382,7 +371,7 @@ class ModelRunner:
         for seq in seqs:
             input_ids.append(seq.last_token)
             context_lens.append(len(seq))
-            slot_mappings.append(seq.block_table[-1]*self.block_size+seq.last_block_num_tokens-1)
+            slot_mapping.append(seq.block_table[-1]*self.block_size+seq.last_block_num_tokens-1)
         
         all_block_tables = [seq.block_table for seq in seqs]
         max_num_blocks = max(len(block_table) for block_table in all_block_tables)
@@ -398,7 +387,7 @@ class ModelRunner:
             cu_seqlens_k=None,
             max_seqlen_q=0,
             max_seqlen_k=0,
-            slot_mappings=torch.tensor(slot_mappings, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            slot_mapping=torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
             context_lens=torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
         )
@@ -442,7 +431,7 @@ class ModelRunner:
             graph_vars = self.graph_vars
             graph_vars['input_ids'][:bs].copy_(input_ids)
             graph_vars['slot_mapping'].fill_(-1)
-            graph_vars['slot_mapping'][:bs].copy_(context.slot_mappings)
+            graph_vars['slot_mapping'][:bs].copy_(context.slot_mapping)
             graph_vars['context_lens'].zero_()
             graph_vars['context_lens'][:bs].copy_(context.context_lens)
             graph_vars['block_tables'][:bs, :context.block_tables.size(1)].copy_(context.block_tables)
@@ -468,8 +457,10 @@ class ModelRunner:
         
         # Prepare sampling temperature and sample tokens from logits.
         token_ids = None
+        temperatures = self.prepare_sample(seqs)
         if self.rank == 0:
-            token_ids = self.sampler(logits, self.prepare_sample(seqs))
+            # Convert token ids to list of int, since sequence only supports int token ids.
+            token_ids = self.sampler(logits, temperatures).tolist()
         
         # Reset context for next forward pass.
         reset_context()

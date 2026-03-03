@@ -1,8 +1,10 @@
 import atexit
 import time
+from dataclasses import fields
 import torch.multiprocessing as mp
 from transformers import AutoTokenizer
 
+from babyvllm.config import Config
 from babyvllm.engine.sequence import Sequence
 from babyvllm.engine.scheduler import Scheduler
 from babyvllm.engine.model_runner import ModelRunner
@@ -22,24 +24,21 @@ def worker_process(config, rank, event):
     model_runner.loop()
 
 class LLMEngine:
-    def __init__(self, config: dict):
-        self.scheduler = Scheduler(
-            max_num_sequences=config.get("max_num_sequences", 16),
-            max_num_batched_tokens=config.get("max_num_batched_tokens", 1024),
-            max_cached_blocks=config.get("max_cached_blocks", 1024),
-            block_size=config.get("block_size",256),
-            eos=config.get("eos", 50256),
-        )
+    def __init__(self, model, **kwargs):
+        config_fields = {field.name for field in fields(Config)}
+        config_kwargs = {k:v for k, v in kwargs.items() if k in config_fields}
+        config = Config(model, **config_kwargs)
+        
+        self.scheduler = Scheduler(config)
         
         # Create and start multiple worker processes.
-        world_size = config.get("world_size", 1)
         # Get Pytorch multiprocessing context and use `spawn` mode instead of 'fork' mode to create worker processes.
         ctx = mp.get_context("spawn")
         # `processes` stores all worker processes and is used to manage them, such as wait for them to finish.
         self.processes = []
         # `events` stores all events that are used to communicate between the main process and worker processes.
         self.events = []
-        for i in range(1, world_size):
+        for i in range(1, config.tensor_parallel_size):
             event = ctx.Event()
             process = ctx.Process(target=worker_process, args=(config, i, event))
             self.processes.append(process)
@@ -50,7 +49,7 @@ class LLMEngine:
         
         # Tokenizer will convert input text into token ids before model execution,
         # and convert token ids back to text after model execution.
-        self.tokenizer = AutoTokenizer.from_pretrained(config.get("model_name_or_path", "gpt2"))
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model)
     
         # When the program exits, clean up resources automatically.
         atexit.register(self.exit)

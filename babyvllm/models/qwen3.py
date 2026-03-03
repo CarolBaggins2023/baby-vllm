@@ -1,9 +1,11 @@
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+from transformers import Qwen3Config
 
 from babyvllm.layers import *
 from babyvllm.utils import get_context
+
 
 class Qwen3Attention(nn.Module):
     """
@@ -13,50 +15,46 @@ class Qwen3Attention(nn.Module):
     (3) Scaled Dot-Product Attention
     (4) Output Projection
     """
-    def __init__(
-        self,
-        hidden_size: int,
-        num_heads: int,
-        head_dim: int|None = None,
-        num_kv_heads: int|None = None,
-        rms_norm_epsilon: float = 1e-5,
-        qkv_bias: bool = False,
-        base: int = 10000,
-        max_position: int = 16384,
-    ):
+    def __init__(self, config: Qwen3Config):
         super().__init__()
         
         self.tp_size = dist.get_world_size()
         
         # Each GPU deals with different attention heads.
-        self.total_num_heads = num_heads
+        self.total_num_heads = config.num_attention_heads
         self.num_heads = self.total_num_heads//self.tp_size
-        self.total_num_kv_heads = num_kv_heads if num_kv_heads is not None else self.total_num_heads
+        self.total_num_kv_heads = config.num_key_value_heads if config.num_key_value_heads is not None else self.total_num_heads
         self.num_kv_heads = self.total_num_kv_heads//self.tp_size
         
-        self.head_dim = head_dim if head_dim is not None else hidden_size//num_heads
+        self.head_dim = config.head_dim if config.head_dim is not None else config.hidden_size//config.num_attention_heads
         self.q_size = self.head_dim*self.num_heads
         self.kv_size = self.head_dim*self.num_kv_heads
-        self.qkv_bias = qkv_bias
+        self.qkv_bias = config.attention_bias
         
         self.scale = self.head_dim**-0.5
         
         self.qkv_proj = QKVColumnParallelLinear(
-            input_size=hidden_size,
+            input_size=config.hidden_size,
             head_size=self.head_dim,
             num_heads=self.total_num_heads,
             num_kv_heads=self.total_num_kv_heads,
-            bias=qkv_bias,
+            bias=self.qkv_bias,
         )
         
         if not self.qkv_bias:
-            self.q_norm = RMSNorm(self.head_dim, rms_norm_epsilon)
-            self.k_norm = RMSNorm(self.head_dim, rms_norm_epsilon)
+            self.q_norm = RMSNorm(
+                hidden_size=self.head_dim,
+                eps=config.rms_norm_eps,
+            )
+            self.k_norm = RMSNorm(
+                hidden_size=self.head_dim,
+                eps=config.rms_norm_eps,
+            )
         
         self.rotary_emb = RotaryEmbedding(
-            base=base,
+            base=config.rope_parameters['rope_theta'],
             rotary_dim=self.head_dim,
-            max_position=max_position,
+            max_position=config.max_position_embeddings,
         )
         
         self.attention = Attention(
@@ -68,8 +66,8 @@ class Qwen3Attention(nn.Module):
         
         self.o_proj = RowParallelLinear(
             input_size=self.head_dim*self.total_num_heads,
-            output_size=hidden_size,
-            bias=qkv_bias,
+            output_size=config.hidden_size,
+            bias=self.qkv_bias,
         )
     
     def forward(
@@ -149,21 +147,17 @@ class Qwen3MLP(nn.Module):
     (2) Activation
     (3) Down Projection
     """
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-    ):
+    def __init__(self, config: Qwen3Config):
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
-            input_size=hidden_size,
-            output_sizes=[intermediate_size]*2,
+            input_size=config.hidden_size,
+            output_sizes=[config.intermediate_size]*2,
             bias=False,
         )
         self.activation = SiluAndMul()
         self.down_proj = RowParallelLinear(
-            input_size=intermediate_size,
-            output_size=hidden_size,
+            input_size=config.intermediate_size,
+            output_size=config.hidden_size,
             bias=False,
         )
     
@@ -181,36 +175,19 @@ class Qwen3DecoderLayer(nn.Module):
     (3) Post-Attention LayerNorm
     (4) MLP
     """
-    def __init__(
-        self,
-        hidden_size: int,
-        num_heads: int,
-        head_dim: int|None = None,
-        num_kv_heads: int|None = None,
-        rms_norm_epsilon: float = 1e-5,
-        qkv_bias: bool = False,
-        base: int = 10000,
-        max_position: int = 16384,
-        intermediate_size: int = 4*1024,
-    ):
+    def __init__(self, config: Qwen3Config):
         super().__init__()
         
-        self.input_layernorm = RMSNorm(hidden_size, rms_norm_epsilon)
-        self.self_attn = Qwen3Attention(
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            num_kv_heads=num_kv_heads,
-            rms_norm_epsilon=rms_norm_epsilon,
-            qkv_bias=qkv_bias,
-            base=base,
-            max_position=max_position,
+        self.input_layernorm = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
         )
-        self.post_attention_layernorm = RMSNorm(hidden_size, rms_norm_epsilon)
-        self.mlp = Qwen3MLP(
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
+        self.self_attn = Qwen3Attention(config)
+        self.post_attention_layernorm = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps
         )
+        self.mlp = Qwen3MLP(config)
     
     def forward(self, x: torch.Tensor, residual: torch.Tensor|None = None) -> torch.Tensor:
         # Shape of input depends on whether it is on prefill or decode stage.
@@ -263,40 +240,20 @@ class Qwen3Model(nn.Module):
     (2) Multiple Self-Attention and MLP
     (3) Final LayerNorm
     """
-    def __init__(
-        self,
-        vocab_size: int,
-        hidden_size: int,
-        num_heads: int,
-        head_dim: int|None = None,
-        num_kv_heads: int|None = None,
-        rms_norm_epsilon: float = 1e-5,
-        qkv_bias: bool = False,
-        base: int = 10000,
-        max_position: int = 16384,
-        intermediate_size: int = 4*1024,
-        num_layers: int = 12,
-    ):
+    def __init__(self, config: Qwen3Config):
         super().__init__()
         
         self.embed_tokens = VocabParallelEmbedding(
-            num_embeddings=vocab_size,
-            embedding_dim=hidden_size,
+            num_embeddings=config.vocab_size,
+            embedding_dim=config.hidden_size,
         )
         self.layers = nn.ModuleList([
-            Qwen3DecoderLayer(
-                hidden_size=hidden_size,
-                num_heads=num_heads,
-                head_dim=head_dim,
-                num_kv_heads=num_kv_heads,
-                rms_norm_epsilon=rms_norm_epsilon,
-                qkv_bias=qkv_bias,
-                base=base,
-                max_position=max_position,
-                intermediate_size=intermediate_size,
-            ) for _ in range(num_layers)
+            Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)
         ])
-        self.norm = RMSNorm(hidden_size, rms_norm_epsilon)
+        self.norm = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+        )
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # (1) Embedding
@@ -321,43 +278,18 @@ class Qwen3ForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
     
-    def __init__(
-        self,
-        vocab_size: int,
-        hidden_size: int,
-        num_heads: int,
-        head_dim: int|None = None,
-        num_kv_heads: int|None = None,
-        rms_norm_epsilon: float = 1e-5,
-        qkv_bias: bool = False,
-        base: int = 10000,
-        max_position: int = 16384,
-        intermediate_size: int = 4*1024,
-        num_layers: int = 12,
-        tie_word_embeddings: bool = False, # Whether to tie the word embeddings and the LM head.
-    ):
+    def __init__(self, config: Qwen3Config):
+        # tie_word_embeddings: Whether to tie the word embeddings and the LM head.
         super().__init__()
         
-        self.model = Qwen3Model(
-            vocab_size=vocab_size,
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            num_kv_heads=num_kv_heads,
-            rms_norm_epsilon=rms_norm_epsilon,
-            qkv_bias=qkv_bias,
-            base=base,
-            max_position=max_position,
-            intermediate_size=intermediate_size,
-            num_layers=num_layers,
-        )
+        self.model = Qwen3Model(config)
         
         self.lm_head = ParallelLMHead(
-            num_embeddings=vocab_size,
-            embedding_dim=hidden_size,
+            num_embeddings=config.vocab_size,
+            embedding_dim=config.hidden_size,
         )
         
-        if tie_word_embeddings:
+        if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
     
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:

@@ -1,16 +1,12 @@
 from collections import deque
+
+from babyvllm.config import Config
 from babyvllm.engine.block_manager import BlockManager
 from babyvllm.engine.sequence import Sequence, SequenceStatus
 
+
 class Scheduler:
-    def __init__(
-        self,
-        max_num_sequences: int,
-        max_num_batched_tokens: int,
-        max_cached_blocks: int,
-        block_size: int,
-        eos: int,
-    ):
+    def __init__(self, config: Config):
         """
         Args:
             max_num_sequences: The maximum number of sequences that can be scheduled in a single run.
@@ -21,14 +17,14 @@ class Scheduler:
         """
         
         # block manager
-        self.block_manager = BlockManager(num_blocks=max_cached_blocks, block_size=block_size)
-        self.max_num_sequences = max_num_sequences
-        self.max_num_batched_tokens = max_num_batched_tokens
+        self.block_manager = BlockManager(num_blocks=config.num_kvcache_blocks, block_size=config.kvcache_block_size)
+        self.max_num_sequences = config.max_num_sequences
+        self.max_num_batched_tokens = config.max_num_batched_tokens
         
         # sequence queue
         self.waiting = deque()
         self.running = deque()
-        self.eos = eos
+        self.eos = config.hf_config.eos_token_id if config.hf_config.eos_token_id is not None else config.eos
         
     def is_finished(self):
         """ Check if all sequences have finished. """
@@ -104,7 +100,7 @@ class Scheduler:
         for seq, token_id in zip(seqs, token_ids):
             seq.append_token(token_id)
             
-            # In three cases, a sequence will stop append new tokens:
+            # In following cases, a sequence will stop append new tokens:
             # (1) The eos token is generated.
             stop_check_eos = not seq.ignore_eos and token_id == self.eos
             # (2) The number of completion tokens exceeds the limit.

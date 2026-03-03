@@ -154,8 +154,7 @@ class ModelRunner:
         
         # Delete CUDA graphs.
         if not self.enforce_eager:
-            del self.graphs
-            del self.graph_vars
+            del self.graphs, self.graph_vars, self.graph_pool
         torch.cuda.synchronize()
         
         # Destroy process group.
@@ -235,6 +234,7 @@ class ModelRunner:
         # Create fake inputs for capturing CUDA graph with maximum batch size and maximum sequence length.
         # In decode phase, input is a single token id for each sequence, so the shape is always (batch_size,).
         input_ids = torch.zeros(max_bs, dtype=torch.int64, device=f'cuda:{self.rank}')
+        positions = torch.zeros(max_bs, dtype=torch.int64, device=f'cuda:{self.rank}')
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32, device=f'cuda:{self.rank}')
         context_lens = torch.zeros(max_bs, dtype=torch.int32, device=f'cuda:{self.rank}')
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=f'cuda:{self.rank}')
@@ -245,7 +245,7 @@ class ModelRunner:
         # {batch_size : CUDAGraph}
         self.graphs = {}
         # Graph pool allows to reuse memory of CUDA graph with different batch sizes.
-        graph_pool = None
+        self.graph_pool = None
         
         for batch_size in reversed(batch_sizes):
             graph = torch.cuda.CUDAGraph()
@@ -262,7 +262,7 @@ class ModelRunner:
             # Warm up.
             # Complete memory allocation before capturing CUDA graph,
             # to ensure stable memory allocation during capturing.
-            outputs[:batch_size] = self.model(input_ids[:batch_size])
+            outputs[:batch_size] = self.model(input_ids[:batch_size], positions[:batch_size])
             
             # Capture CUDA graph.
             # In the context of `torch.cuda.graph`, PyTorch will record:
@@ -270,10 +270,10 @@ class ModelRunner:
             # (2) All memory accesses, including addresses of
             #       input tensor, model parameters, output tensor, and temporary tensors during the forward pass.
             # These information will be saved in torch.cuda.CUDAGraph object.
-            with torch.cuda.graph(graph, graph_pool):
-                outputs[:batch_size] = self.model(input_ids[:batch_size])
-            if graph_pool is None:
-                graph_pool = graph.pool()
+            with torch.cuda.graph(graph, self.graph_pool):
+                outputs[:batch_size] = self.model(input_ids[:batch_size], positions[:batch_size])
+            if self.graph_pool is None:
+                self.graph_pool = graph.pool()
             self.graphs[batch_size] = graph
             
             # Make sure the capture is done before moving to the next capture.
@@ -282,6 +282,7 @@ class ModelRunner:
         
         self.graph_vars = dict(
             input_ids=input_ids,
+            positions=positions,
             slot_mapping=slot_mapping,
             context_lens=context_lens,
             block_tables=block_tables,
@@ -294,6 +295,7 @@ class ModelRunner:
         # All uncached token ids.
         # shape: (sum of number of uncached tokens,)
         input_ids = []
+        positions = []
         # Where the cache of each uncached token should be written to.
         # shape: (sum of number of uncached tokens,)
         slot_mapping = []
@@ -322,6 +324,7 @@ class ModelRunner:
             # Combining seperate sequences into a long sequence,
             # which enables efficient processing with variable length sequences.
             input_ids.extend(token_ids[num_cached_tokens:])
+            positions.extend(list(range(num_cached_tokens, len(seq))))
             seqlens_q.append(len(token_ids)-num_cached_tokens)
             seqlens_k.append(len(token_ids))
             cu_seqlens_q.append(cu_seqlens_q[-1]+seqlens_q[-1])
@@ -344,6 +347,7 @@ class ModelRunner:
         
         # Allocate input token ids to pinned memory buffer, accelerating data transfer between host and device.
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         
         set_context(
             is_prefill=True,
@@ -356,12 +360,13 @@ class ModelRunner:
             context_lens=None,
         )
         
-        return input_ids
+        return input_ids, positions
     
     def prepare_decode(self, seqs: list[Sequence]) -> torch.Tensor:
         """ Prepare the data for decode forward pass. One token per sequence. """
         
         input_ids = []
+        positions = []
         slot_mapping = []
         block_tables = []
         # Number of handled tokens in each sequence.
@@ -370,6 +375,7 @@ class ModelRunner:
         
         for seq in seqs:
             input_ids.append(seq.last_token)
+            positions.append(len(seq)-1)
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1]*self.block_size+seq.last_block_num_tokens-1)
         
@@ -380,6 +386,7 @@ class ModelRunner:
             block_tables.append(aligned_block_table)
 
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         
         set_context(
             is_prefill=False,
@@ -392,7 +399,7 @@ class ModelRunner:
             context_lens=torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
         )
         
-        return input_ids
+        return input_ids, positions
     
     def prepare_sample(self, seqs: list[Sequence]) -> torch.Tensor:
         """ Prepare sampling temperature for each sequence. """
@@ -404,7 +411,7 @@ class ModelRunner:
         return temperatures
     
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, is_prefill: bool):
+    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         """
         Run model inference for a batch of sequences and return logits.
         In decode phase, replaying CUDA graph to accelerate inference.
@@ -415,7 +422,7 @@ class ModelRunner:
         #     but CUDA graph requires fixed computation graph and memory assess mode.
         # (2) Enforce eager mode. CUDA graph does not support manual control flow.
         if is_prefill or self.enforce_eager:
-            logits = self.model.compute_logits(self.model(input_ids))
+            logits = self.model.compute_logits(self.model(input_ids, positions))
         # Use CUDA graph for decode phase.
         else:
             bs = input_ids.size(0)
@@ -429,12 +436,13 @@ class ModelRunner:
             # Copy input data into graph variables.
             # Do not change memory layout which has been captured. Use in-place operations.
             graph_vars = self.graph_vars
-            graph_vars['input_ids'][:bs].copy_(input_ids)
+            graph_vars['input_ids'][:bs] = input_ids
+            graph_vars['positions'][:bs] = positions
             graph_vars['slot_mapping'].fill_(-1)
-            graph_vars['slot_mapping'][:bs].copy_(context.slot_mapping)
+            graph_vars['slot_mapping'][:bs] = context.slot_mapping
             graph_vars['context_lens'].zero_()
-            graph_vars['context_lens'][:bs].copy_(context.context_lens)
-            graph_vars['block_tables'][:bs, :context.block_tables.size(1)].copy_(context.block_tables)
+            graph_vars['context_lens'][:bs] = context.context_lens
+            graph_vars['block_tables'][:bs, :context.block_tables.size(1)] = context.block_tables
             
             # Replay CUDA graph.
             graph.replay()
@@ -448,12 +456,12 @@ class ModelRunner:
         
         # Prepare the data for forward pass (prefill or decode).
         if is_prefill:
-            input_ids  = self.prepare_prefill(seqs)
+            input_ids, positions = self.prepare_prefill(seqs)
         else:
-            input_ids = self.prepare_decode(seqs)
+            input_ids, positions = self.prepare_decode(seqs)
         
         # Execute model inference.
-        logits = self.run_model(input_ids, is_prefill)
+        logits = self.run_model(input_ids, positions, is_prefill)
         
         # Prepare sampling temperature and sample tokens from logits.
         token_ids = None

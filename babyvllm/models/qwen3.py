@@ -189,7 +189,12 @@ class Qwen3DecoderLayer(nn.Module):
         )
         self.mlp = Qwen3MLP(config)
     
-    def forward(self, x: torch.Tensor, residual: torch.Tensor|None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        residual: torch.Tensor|None = None,
+    ) -> torch.Tensor:
         # Shape of input depends on whether it is on prefill or decode stage.
         
         # (1) Input LayerNorm
@@ -198,31 +203,7 @@ class Qwen3DecoderLayer(nn.Module):
         else:
             x, residual = self.input_layernorm(x), x
             
-        # (2) Calculate Positions and Self-Attention
-        context = get_context()
-        # Batched Prefill
-        if context.is_prefill and context.cu_seqlens_q is not None:
-            # Position indices for each sequence in the batch restart from 0.
-            # For example, if cu_seqlens_q is [0, 5, 8, 12],
-            # the start and end indices of each sequence are [0, 4], [5, 7], [8, 11].
-            # Position indices for each sequence are
-            # Sequence 0: [0, 1, 2, 3, 4],
-            # Sequence 1: [0, 1, 2],
-            # Sequence 2: [0, 1, 2, 3].
-            positions = []
-            cu_seqlens = context.cu_seqlens_q.cpu().tolist()
-            for i in range(len(cu_seqlens)-1):
-                seq_len = cu_seqlens[i+1]-cu_seqlens[i]
-                positions.extend(range(seq_len))
-            positions = torch.tensor(positions, dtype=torch.long, device=x.device)
-        # Single Sequence Prefill
-        elif context.is_prefill:
-            positions = torch.arange(x.size(0), device=x.device)
-        # Decode
-        else:
-            # In each sequence, the position index of last token is the sequence length - 1.
-            positions = context.context_lens-1
-        
+        # (2) Self-Attention        
         x = self.self_attn(x, positions)
         
         # (3) Post-Attention LayerNorm
@@ -255,14 +236,14 @@ class Qwen3Model(nn.Module):
             eps=config.rms_norm_eps,
         )
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         # (1) Embedding
         x = self.embed_tokens(x)
         
         # (2) Multiple Self-Attention and MLP
         residual = None
         for layer in self.layers:
-            x, residual = layer(x, residual)
+            x, residual = layer(x, positions, residual)
         
         # (3) Final LayerNorm
         x, _ = self.norm(x, residual)
@@ -292,8 +273,8 @@ class Qwen3ForCausalLM(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
     
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        x = self.model(input_ids)
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        x = self.model(input_ids, positions)
         return x
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:

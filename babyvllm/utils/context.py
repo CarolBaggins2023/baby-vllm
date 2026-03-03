@@ -71,7 +71,7 @@ def set_context(
     max_seqlen_q = 0,
     cu_seqlens_k = None,
     max_seqlen_k = 0,
-    slot_mappings=None,
+    slot_mapping=None,
     block_tables=None,
     context_lens=None,
 ):
@@ -82,7 +82,7 @@ def set_context(
         max_seqlen_q,
         cu_seqlens_k,
         max_seqlen_k,
-        slot_mappings,
+        slot_mapping,
         block_tables,
         context_lens,
     )

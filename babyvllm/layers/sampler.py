@@ -10,7 +10,7 @@ class Sampler(nn.Module):
         super().__init__()
     
     @torch.compile
-    def forward(self, logits: torch.Tensor, temperature: torch.Tensor) -> torch.Tensor:
+    def forward(self, logits: torch.Tensor, temperature: torch.Tensor):
         # logits shape: (seq_len, vocab_size)
         logits /= temperature.unsqueeze(-1)
         probs = torch.softmax(logits, dim=-1)

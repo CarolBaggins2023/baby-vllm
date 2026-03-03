@@ -59,7 +59,8 @@ class BlockManager:
         # If one block used to store a segement of token ids, but it is currently not used by that segment,
         # then the id of this block is in `hash_to_block_id`, but not in `used_block_ids`.
     
-    def compute_hash(self, token_ids: list[int], prefix_hash_value: int) -> int:
+    @classmethod
+    def compute_hash(cls, token_ids: list[int], prefix_hash_value: int) -> int:
         """
         Compute the hash value of block.
         Args:
@@ -71,7 +72,7 @@ class BlockManager:
         """
         
         # `h` is the initial hash object.
-        h = xxhash.xx64()
+        h = xxhash.xxh64()
         # If there is a previous block, then update the hash object with the hash value of previous block.
         if prefix_hash_value != -1:
             # Update the hash object with the hash value of previous block.

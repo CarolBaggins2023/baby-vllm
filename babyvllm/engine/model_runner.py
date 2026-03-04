@@ -241,13 +241,13 @@ class ModelRunner:
         outputs = torch.zeros(max_bs, self.config.hf_config.hidden_size, device=f'cuda:{self.rank}')
         
         # Which batch sizes we want to capture CUDA graph for.
-        batch_sizes = [1, 2, 4, 8]+list(range(16,max_bs+1, 16))
+        self.graph_batch_sizes = [1, 2, 4, 8]+list(range(16,max_bs+1, 16))
         # {batch_size : CUDAGraph}
         self.graphs = {}
         # Graph pool allows to reuse memory of CUDA graph with different batch sizes.
         self.graph_pool = None
         
-        for batch_size in reversed(batch_sizes):
+        for batch_size in reversed(self.graph_batch_sizes):
             graph = torch.cuda.CUDAGraph()
             set_context(
                 is_prefill=False,
@@ -431,7 +431,7 @@ class ModelRunner:
             # Find the CUDA graph that can handle current batch size while minimize memory waste.
             # `next(bs_ for bs_ in self.graphs.keys() if bs_ >= bs)` 
             # finds the smallest batch size that is >= to current batch size.
-            graph = self.graphs[next(bs_ for bs_ in self.graphs.keys() if bs_ >= bs)]
+            graph = self.graphs[next(bs_ for bs_ in self.graph_batch_sizes if bs_ >= bs)]
             
             # Copy input data into graph variables.
             # Do not change memory layout which has been captured. Use in-place operations.
@@ -459,16 +459,16 @@ class ModelRunner:
             input_ids, positions = self.prepare_prefill(seqs)
         else:
             input_ids, positions = self.prepare_decode(seqs)
+            
+        # Prepare sampling temperatures.
+        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         
         # Execute model inference.
         logits = self.run_model(input_ids, positions, is_prefill)
         
-        # Prepare sampling temperature and sample tokens from logits.
-        token_ids = None
-        temperatures = self.prepare_sample(seqs)
-        if self.rank == 0:
-            # Convert token ids to list of int, since sequence only supports int token ids.
-            token_ids = self.sampler(logits, temperatures).tolist()
+        # Sample tokens from logits.
+        # Convert token ids to list of int, since sequence only supports int token ids.
+        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         
         # Reset context for next forward pass.
         reset_context()

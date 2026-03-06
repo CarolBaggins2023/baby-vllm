@@ -56,13 +56,13 @@ class VocabParallelEmbedding(nn.Module):
     def forward(self, x: torch.Tensor):
         """
         Args:
-            x: The input tensor of shape (total_tokens,) in prefill stage or (batch_size,) in decode stage.
+            x: The input tensor of shape (total_tokens,).
         Returns:
-            The output tensor of shape (total_tokens, embedding_dim) in prefill stage or (batch_size, embedding_dim) in decode stage.
+            The output tensor of shape (total_tokens, embedding_dim).
         """
         if self.tp_size > 1:
             # Filter out the indices that are responsible for the current device.
-            # mask shape: (batch_size, seq_len)
+            # mask shape: (total_tokens,)
             mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
             # `x-self.vocab_start_idx` convert the global token ID to the local index on the current device.
             # For example, the global token ID is 1200, the beginning index of the current device is 1000,
@@ -71,7 +71,7 @@ class VocabParallelEmbedding(nn.Module):
             # and will be filtered out in the next step.
             x = mask*(x-self.vocab_start_idx)
             
-        # output shape: (batch_size, seq_len, embedding_dim)
+        # output shape: (total_tokens, embedding_dim)
         output = F.embedding(x, self.weight)
         
         # The output elements of "mask == False" and "x == self.vocab_start_idx" are all `self.weight[0]`,
@@ -95,20 +95,20 @@ class ParallelLMHead(VocabParallelEmbedding):
     def forward(self, x: torch.Tensor):
         """
         Args:
-            x: The input tensor of shape (total_tokens, embedding_dim) in prefill stage or (batch_size, embedding_dim) in decode stage.
+            x: The input tensor of shape (total_tokens, embedding_dim).
         Returns:
             The logits tensor of shape (batch_size, num_embeddings).
         """
         context = get_context()
         if context.is_prefill:
-            # In prefill stage, shape of input tensor is (total_tokens, embedding_dim).
+            # shape of input tensor is (total_tokens, embedding_dim).
             # We only need the logits of the last token in each sequence.
             last_token = context.cu_seqlens_q[1:]-1
             x = x[last_token].contiguous()
         
         # `F.linear` automatically transpose the weight matrix.
         # `self.weight` is derived from the parallel embedding layer, which achieves parameter sharing.
-        # logits shape: (batch_size, seq_len, num_embeddings_per_partition)
+        # logits shape: (total_tokens, num_embeddings_per_partition)
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
             # GPU 0 gathers the logits from all GPUs.
@@ -119,10 +119,10 @@ class ParallelLMHead(VocabParallelEmbedding):
             
             # Concatenate the logits from all GPUs and trim the extra embeddings.
             if self.tp_rank == 0:
-                # logits shape: (batch_size, seq_len, padded_num_embeddings)
+                # logits shape: (total_tokens, padded_num_embeddings)
                 logits = torch.cat(all_logits, dim=-1)
-                # logits shape: (batch_size, seq_len, num_embeddings)
-                logits = logits[:, :, :self.num_embeddings]
+                # logits shape: (total_tokens, num_embeddings)
+                logits = logits[:, :self.num_embeddings]
             
         # No need to broadcast the logits to all GPUs, since the main GPU will execute the sampling.
         

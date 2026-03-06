@@ -201,7 +201,7 @@ class ModelRunner:
         
         # ===== (2) Find parameters to compute kv cache size. =====
         num_layers = self.config.hf_config.num_hidden_layers
-        num_kv_heads = self.config.hf_config.num_key_value_heads
+        num_kv_heads = self.config.hf_config.num_key_value_heads//self.world_size
         head_dim = self.config.hf_config.head_dim
         
         # ===== (3) Compute kv cache block size and number of available blocks. =====

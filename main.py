@@ -18,7 +18,7 @@ def main():
         model_name_or_path = '/root/autodl-tmp/Qwen/Qwen3-0.6B'
         tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
         
-        llm = LLMEngine(model_name_or_path, enforce_eager=False)
+        llm = LLMEngine(model_name_or_path, enforce_eager=False, tensor_parallel_size=1)
         
         sampling_params = SamplingParams(temperature=0.6, max_tokens=512)
         

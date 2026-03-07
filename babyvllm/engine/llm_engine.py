@@ -1,6 +1,7 @@
 import atexit
 import time
 from dataclasses import fields
+import torch
 import torch.multiprocessing as mp
 from transformers import AutoTokenizer
 
@@ -29,8 +30,6 @@ class LLMEngine:
         config_kwargs = {k:v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
         
-        self.scheduler = Scheduler(config)
-        
         # Create and start multiple worker processes.
         # Get Pytorch multiprocessing context and use `spawn` mode instead of 'fork' mode to create worker processes.
         ctx = mp.get_context("spawn")
@@ -50,6 +49,9 @@ class LLMEngine:
         # Tokenizer will convert input text into token ids before model execution,
         # and convert token ids back to text after model execution.
         self.tokenizer = AutoTokenizer.from_pretrained(config.model)
+        
+        # Construct scheduler after model runner, because scheduler needs to know the number of kv cache blocks.
+        self.scheduler = Scheduler(config)
     
         # When the program exits, clean up resources automatically.
         atexit.register(self.exit)
@@ -103,20 +105,57 @@ class LLMEngine:
         
         # {sequence id : generated tokens}
         generated_tokens = {}
+        
+        # Metrics collection
+        total_tokens = 0
+        total_time = 0
+        memory_usages = []
+        gpu_utilizations = []
+        inference_start_time = time.time()
+        
         while not self.scheduler.is_finished():
             start_time = time.time()
             # Call scheduler and model runner to run the model.
             # outputs: {sequence id : generated tokens}
             outputs, num_processed_tokens, is_prefill = self.step()
             end_time = time.time()
-            if print_log:
-                running_time = end_time-start_time+1e-10
-                print_log = f"number of processed tokens: {num_processed_tokens}, token/sec during {'prefilling' if is_prefill else 'decoding'}: {num_processed_tokens/running_time}"
-                print(print_log)
+            
+            # Collect metrics
+            total_tokens += num_processed_tokens
+            step_time = end_time-start_time
+            total_time += step_time
+            
+            # Get memory usage
+            memory_stats = torch.cuda.memory_stats()
+            memory_usage = memory_stats['allocated_bytes.all.current']/(1024**2)  # Convert to MB
+            memory_usages.append(memory_usage)
+            
+            # Get GPU utilization
+            gpu_util = torch.cuda.utilization()
+            gpu_utilizations.append(gpu_util)
+
             generated_tokens.update({seq_id : tokens for seq_id, tokens in outputs})
 
         # Sort generated tokens by sequence id. So, the output text are in the same order as user input.
         generated_tokens = [generated_tokens[seq_id] for seq_id in sorted(generated_tokens.keys())]
+        
+        # Calculate metrics
+        inference_end_time = time.time()
+        total_inference_time = inference_end_time-inference_start_time
+        average_throughput = total_tokens/total_inference_time if total_inference_time > 0 else 0
+        average_memory = sum(memory_usages)/len(memory_usages) if memory_usages else 0
+        average_gpu_util = sum(gpu_utilizations)/len(gpu_utilizations) if gpu_utilizations else 0
+        
+        # Print metrics
+        if print_log:
+            print(f"\n=== Inference Metrics ===")
+            print(f"Total tokens processed: {total_tokens}")
+            print(f"Total inference time: {total_inference_time:.4f} seconds")
+            print(f"Average throughput: {average_throughput:.2f} tokens/second")
+            print(f"Average memory usage: {average_memory:.2f} MB")
+            if gpu_utilizations:
+                print(f"Average GPU utilization: {average_gpu_util:.2f}%")
+            print("========================\n")
         
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in generated_tokens]
         return outputs

@@ -190,33 +190,38 @@ class ModelRunner:
         torch.cuda.empty_cache()
     
     def allocate_kv_cache(self):
-        # ===== (1) Find available memory while reserving room for model execution. =====
-        # Get free memory and total memory of the current device.
+        # ===== (1) Find available memory for kv cache. =====
+        # `total_mem` is the total memory of the current device.
+        # `total_mem*self.config.gpu_memory_utilization` is the memory allowed to use, reserving some for other purposes, such as cuda context.
         free_mem, total_mem = torch.cuda.mem_get_info()
-        total_free_mem = free_mem*self.config.gpu_memory_utilization
-        # Reserve room for model execution.
+        # `used_mem` is the memory already used, which is cannot be allocated to kv cache.
+        used_mem = total_mem-free_mem
+        # `peak_mem_usage` is the maximum allocated memory begin from `reset_peak_memory_stats()` in model warmup,
+        # which is the peak memory usage of the model execution.
         peak_mem_usage = torch.cuda.memory_stats()['allocated_bytes.all.peak']
+        # `current_mem_usage` is the current allocated memory. Because `empty_cache()` is called at the end of model warmup,
+        # current memory usage is much smaller than peak memory usage.
         current_mem_usage = torch.cuda.memory_stats()['allocated_bytes.all.current']
-        available_mem = total_free_mem-(peak_mem_usage-current_mem_usage)
+        # `peak_mem_usage-current_mem_usage` is the possible memory usage increase during model execution,
+        # so it should be reserved to ensure the model can run without OOM.
+        available_mem = total_mem*self.config.gpu_memory_utilization-used_mem-peak_mem_usage+current_mem_usage
         
-        # ===== (2) Find parameters to compute kv cache size. =====
+        # ===== (2) Compute kv cache block size and number of available blocks. =====
         num_layers = self.config.hf_config.num_hidden_layers
         num_kv_heads = self.config.hf_config.num_key_value_heads//self.world_size
         head_dim = self.config.hf_config.head_dim
-        
-        # ===== (3) Compute kv cache block size and number of available blocks. =====
         # size of one kv cache block in bytes
         # "*2" because we need to store both key and value.
         block_size_bytes = self.block_size*2*num_layers*num_kv_heads*head_dim*self.default_dtype.itemsize
-        self.num_available_kv_blocks = int(available_mem//block_size_bytes)
-        assert self.num_available_kv_blocks >= 1, f"Not enough memory to hold even one kv cache block on rank {self.rank}."
+        self.config.num_kvcache_blocks = int(available_mem)//block_size_bytes
+        assert self.config.num_kvcache_blocks >= 1, f"Not enough memory to hold even one kv cache block on rank {self.rank}."
     
-        # ===== (4) Allocate memory for kv cache. =====
+        # ===== (3) Allocate memory for kv cache. =====
         # Although `allocated_kv_cache` is a local variable, it will not be deleted out of the function,
         # because it will be referred by kv cache variables in model layers.
-        allocated_kv_cache = torch.empty(2, num_layers, self.num_available_kv_blocks, self.block_size, num_kv_heads, head_dim, device=f'cuda:{self.rank}')
+        allocated_kv_cache = torch.empty(2, num_layers, self.config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim, device=f'cuda:{self.rank}')
 
-        # ===== (5) Divide the giant kv cache pool into blocks and assign blocks to layers in model. =====
+        # ===== (4) Divide the giant kv cache pool into blocks and assign blocks to layers in model. =====
         layer_id = 0
         for module in self.model.modules():
             # `Attention` layer has `k_cache` and `v_cache` attributes.

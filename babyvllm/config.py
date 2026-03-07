@@ -14,7 +14,7 @@ class Config:
     enforce_eager: bool = False
     eos: int = -1
     kvcache_block_size: int = 256
-    num_kvcache_blocks: int = 1024
+    num_kvcache_blocks: int = -1
     # Store some configs in huggingface' config.
     hf_config: AutoConfig | None = None
     

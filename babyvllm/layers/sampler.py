@@ -11,7 +11,7 @@ class Sampler(nn.Module):
     
     @torch.compile
     def forward(self, logits: torch.Tensor, temperature: torch.Tensor):
-        # logits shape: (seq_len, vocab_size)
+        # logits shape: (total_tokens, vocab_size)
         logits = logits.float().div_(temperature.unsqueeze(dim=1))
         probs = torch.softmax(logits, dim=-1)
         sample_tokens = probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax(dim=-1)

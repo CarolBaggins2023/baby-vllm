@@ -420,6 +420,11 @@ class ModelRunner:
         """
         Run model inference for a batch of sequences and return logits.
         In decode phase, replaying CUDA graph to accelerate inference.
+        
+        Args:
+            input_ids: Input token ids. shape: (total_tokens,)
+            positions: Positions of each token. shape: (total_tokens,)
+            is_prefill: Whether it is prefill phase.
         """
         
         # In two cases, we can not use CUDA graph:
@@ -460,6 +465,7 @@ class ModelRunner:
         """ Run model inference for a batch of sequences and return output token ids. """
         
         # Prepare the data for forward pass (prefill or decode).
+        # input_ids, positions shape: (total_tokens,)
         if is_prefill:
             input_ids, positions = self.prepare_prefill(seqs)
         else:

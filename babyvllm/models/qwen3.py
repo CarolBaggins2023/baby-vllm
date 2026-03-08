@@ -76,8 +76,8 @@ class Qwen3Attention(nn.Module):
         positions: torch.Tensor,
     ) -> torch.Tensor:
         # `x` is replicated across all GPUs.
-        # x shape: (batch_size, seq_len, hidden_size)
-        # positions shape: (batch_size, seq_len)
+        # x shape: (total_tokens, hidden_size)
+        # positions shape: (total_tokens,)
         
         # Column Parallel Linear -> Scaled Dot-Product (GPU 0)         -> Row Parallel Linear
         #                        -> Scaled Dot-Product (GPU 1)         ->
@@ -86,7 +86,7 @@ class Qwen3Attention(nn.Module):
         
         # ===== (1) QKV Projection and Split (Sharding Happens) =====
         # `QKVColumnParallelLinear` returns the shard of qkv.
-        # qkv shape: (batch_size, seq_len, head_dim*(num_heads+2*num_kv_heads))
+        # qkv shape: (total_tokens, head_dim*(num_heads+2*num_kv_heads))
         qkv = self.qkv_proj(x)
         
         # Split qkv into q, k, and v, according to their sizes.
@@ -94,21 +94,11 @@ class Qwen3Attention(nn.Module):
         
         # Split heads for q, k, and v.
         # Handle both varlen mode (2D) and batched mode (3D).
-        if q.dim() == 2:
-            # Varlen Mode
-            # q shape: (total_tokens, q_size) -> (total_tokens, num_heads, head_dim)
-            q = q.view(-1, self.num_heads, self.head_dim)
-            # k, v shape: (total_tokens, kv_size) -> (total_tokens, num_kv_heads, head_dim)
-            k = k.view(-1, self.num_kv_heads, self.head_dim)
-            v = v.view(-1, self.num_kv_heads, self.head_dim)
-        else:
-            # Batched Mode
-            batch_size, seq_len, _ = q.shape
-            # q shape: (batch_size, seq_len, q_size) -> (batch_size, seq_len, num_heads, head_dim)
-            q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
-            # k, v shape: (batch_size, seq_len, kv_size) -> (batch_size, seq_len, num_kv_heads, head_dim)
-            k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-            v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        # q shape: (total_tokens, q_size) -> (total_tokens, num_heads, head_dim)
+        q = q.view(-1, self.num_heads, self.head_dim)
+        # k, v shape: (total_tokens, kv_size) -> (total_tokens, num_kv_heads, head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
         
         # ===== (2) Normalize Q and K and Apply Rotary Embedding =====
         # When computing attention weights, there is softmax(q.dot(k)/sqrt(head_dim)).
@@ -122,20 +112,14 @@ class Qwen3Attention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         
         # ===== (3) Scaled Dot-Product Attention =====
-        # o shape: 
-        # Prefill phase (batch_size*seq_len, num_heads, head_dim)
-        # Decode phase (batch_size, seq_len, num_heads, head_dim)
+        # o shape: (total_tokens, num_heads, head_dim)
         o = self.attention(q, k, v)
-        if o.dim() == 4:
-            batch_size, seq_len, num_heads, head_dim = o.shape
-            o = o.view(batch_size*seq_len, num_heads, head_dim)
         
         # ===== (4) Output Projection (Communication Happens by All Reduce) =====
         # Merge heads.
-        # o shape: (batch_size*seq_len, num_heads, head_dim) ->
-        # (batch_size*seq_len, num_heads*head_dim)
+        # o shape: (total_tokens, num_heads, head_dim) -> (total_tokens, num_heads*head_dim)
         o = o.view(o.shape[0], -1)
-        # o shape: (batch_size*seq_len, hidden_size)
+        # o shape: (total_tokens, hidden_size)
         o = self.o_proj(o)
         
         return o
@@ -195,8 +179,6 @@ class Qwen3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         residual: torch.Tensor|None = None,
     ) -> torch.Tensor:
-        # Shape of input depends on whether it is on prefill or decode stage.
-        
         # (1) Input LayerNorm
         if residual is not None:
             x, residual = self.input_layernorm(x, residual)
@@ -237,6 +219,9 @@ class Qwen3Model(nn.Module):
         )
     
     def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        # x shape: (total_tokens,) -> (total_tokens, embedding_dim)
+        # positions shape: (total_tokens,)
+        
         # (1) Embedding
         x = self.embed_tokens(x)
         
@@ -274,6 +259,7 @@ class Qwen3ForCausalLM(nn.Module):
             self.lm_head.weight = self.model.embed_tokens.weight
     
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        # input_ids, positions shape: (total_tokens,)
         x = self.model(input_ids, positions)
         return x
 

@@ -50,6 +50,9 @@ class LLMEngine:
         # and convert token ids back to text after model execution.
         self.tokenizer = AutoTokenizer.from_pretrained(config.model)
         
+        # Adapt the block size of Sequence to the kv cache block size.
+        Sequence.block_size = config.kvcache_block_size
+        
         # Construct scheduler after model runner, because scheduler needs to know the number of kv cache blocks.
         self.scheduler = Scheduler(config)
     

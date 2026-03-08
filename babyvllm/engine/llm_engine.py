@@ -115,6 +115,9 @@ class LLMEngine:
         memory_usages = []
         gpu_utilizations = []
         inference_start_time = time.time()
+        first_token_times = {}
+        sequence_start_times = {}
+        sequence_token_counts = {}
         
         while not self.scheduler.is_finished():
             start_time = time.time()
@@ -137,8 +140,15 @@ class LLMEngine:
             gpu_util = torch.cuda.utilization()
             gpu_utilizations.append(gpu_util)
 
-            generated_tokens.update({seq_id : tokens for seq_id, tokens in outputs})
-
+            # Update generated tokens and track TTFT
+            for seq_id, tokens in outputs:
+                if seq_id not in sequence_start_times:
+                    sequence_start_times[seq_id] = inference_start_time
+                if seq_id not in first_token_times and len(tokens) > 0:
+                    first_token_times[seq_id] = time.time()
+                sequence_token_counts[seq_id] = len(tokens)
+                generated_tokens[seq_id] = tokens
+                
         # Sort generated tokens by sequence id. So, the output text are in the same order as user input.
         generated_tokens = [generated_tokens[seq_id] for seq_id in sorted(generated_tokens.keys())]
         
@@ -148,6 +158,22 @@ class LLMEngine:
         average_throughput = total_tokens/total_inference_time if total_inference_time > 0 else 0
         average_memory = sum(memory_usages)/len(memory_usages) if memory_usages else 0
         average_gpu_util = sum(gpu_utilizations)/len(gpu_utilizations) if gpu_utilizations else 0
+
+        ttft_values = []
+        tpot_values = []
+        for seq_id in sequence_start_times:
+            if seq_id in first_token_times:
+                ttft = first_token_times[seq_id] - sequence_start_times[seq_id]
+                ttft_values.append(ttft)
+                
+                if seq_id in sequence_token_counts and sequence_token_counts[seq_id] > 0:
+                    # TPOT = (total generation time - TTFT) / number of tokens
+                    total_gen_time = inference_end_time - first_token_times[seq_id]
+                    tpot = total_gen_time / sequence_token_counts[seq_id] if sequence_token_counts[seq_id] > 0 else 0
+                    tpot_values.append(tpot)
+        average_ttft = sum(ttft_values)/len(ttft_values) if ttft_values else 0
+        average_tpot = sum(tpot_values)/len(tpot_values) if tpot_values else 0
+        
         
         # Print metrics
         if print_log:
@@ -156,8 +182,10 @@ class LLMEngine:
             print(f"Total inference time: {total_inference_time:.4f} seconds")
             print(f"Average throughput: {average_throughput:.2f} tokens/second")
             print(f"Average memory usage: {average_memory:.2f} MB")
-            if gpu_utilizations:
-                print(f"Average GPU utilization: {average_gpu_util:.2f}%")
+            print(f"Average GPU utilization: {average_gpu_util:.2f}%")
+            print(f"Average TTFT: {average_ttft:.4f} seconds")
+            print(f"Average TPOT: {average_tpot:.4f} seconds/token")
+
             print("========================\n")
         
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in generated_tokens]

@@ -132,15 +132,10 @@ class BlockManager:
             # Fetch the block id from hash value to block id mapping.
             # If the hash value is not found, then set the block id to -1, which means cache miss.
             block_id = self.hash_to_block_id.get(h, -1)
-            
-            # `no_cache_found == False` means an existing block can be reused.
-            # `no_cache_found == True` means a new block needs to be allocated.
-            no_cache_found = False
+            cache_collision = block_id != -1 and self.blocks[block_id].token_ids != token_ids
             # `block_id == -1` means cache miss.
-            # `self.blocks[block_id].token_ids != token_ids` means hash collision.
             # Both cache miss and hash collision means no cache found.
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
-                no_cache_found = True
+            no_cache_found = block_id == -1 or cache_collision
             
             if not no_cache_found:
                 # Update sequence information.

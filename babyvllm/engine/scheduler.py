@@ -8,6 +8,10 @@ from babyvllm.engine.sequence import Sequence, SequenceStatus
 class Scheduler:
     def __init__(self, config: Config):
         """
+        (1) Manage kv cache blocks. Create the BlockManager object.
+        (2) Track sequence status. Create the waiting queue and running queue.
+        (3) Limitations. Limit the number of sequences and tokens.
+        
         Args:
             max_num_sequences: The maximum number of sequences that can be scheduled in a single run.
             max_num_batched_tokens: The maximum number of tokens that can be scheduled in a single run.

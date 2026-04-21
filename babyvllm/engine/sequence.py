@@ -33,6 +33,11 @@ class Sequence:
         # When the sequence is created, it is filled with prompt tokens.
         self.num_prompt_tokens = len(self.token_ids)
         
+        # `block_table` stores the physical block ids assigned by BlockManager to this sequence.
+        # For example, if the sequence is divided into 3 logical blocks,
+        # and BlockManager places the kv cache of these logical blocks in the 10th, 45th, and 2nd
+        # blocks of the physical memory pool, then the `block_table` of this sequence will be [10, 45, 2].
+        # Here, the physical memory pool is the `allocated_kv_cache` assigned in `ModelRunner.allocate_kv_cache()`.
         self.num_cached_tokens = 0
         self.block_table = []
         

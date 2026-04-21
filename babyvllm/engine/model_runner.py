@@ -334,6 +334,10 @@ class ModelRunner:
             seqlens_k.append(len(token_ids))
             cu_seqlens_q.append(cu_seqlens_q[-1]+seqlens_q[-1])
             cu_seqlens_k.append(cu_seqlens_k[-1]+seqlens_k[-1])
+            # Traverse the block table of sequence and convert block-level id into token-level id, that is `slot_mapping`.
+            # For example, if the size of 10th block is 256, then the 256 logical tokens belonging to this block have physical
+            # slots ranging from 10*256 to 10*256+255.
+            # The actual operation of storing the kv cache of each token is done by Triton kernel in `layers\attention.py`.
             if seq.block_table:
                 for i, block_id in enumerate(seq.block_table[seq.num_cached_blocks:]):
                     # Check if the block is the last block of the sequence.

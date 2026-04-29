@@ -295,6 +295,9 @@ class ModelRunner:
         )
     
     def prepare_prefill(self, seqs: list[Sequence]) -> torch.Tensor:
+        """ Deprecated. Use `prepare_forward` instead. """
+        
+        
         """ Prepare the data for prefill forward pass. """
         
         # All uncached token ids.
@@ -372,6 +375,9 @@ class ModelRunner:
         return input_ids, positions
     
     def prepare_decode(self, seqs: list[Sequence]) -> torch.Tensor:
+        """ Deprecated. Use `prepare_forward` instead. """
+        
+        
         """ Prepare the data for decode forward pass. One token per sequence. """
         
         input_ids = []
@@ -419,25 +425,113 @@ class ModelRunner:
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
     
+    def prepare_forward(self, seqs: list[Sequence]) -> torch.Tensor:
+        """
+        Unified data preparation for both prefill, decode, and mixed batches.
+        """
+        
+        # All uncached token ids and their positions.
+        input_ids = []
+        positions = []
+        # Where the cache of each uncached token should be written to.
+        slot_mapping = []
+        # Number of all tokens in each sequence.
+        seqlens_q = []
+        # Cumulative sum of `seqlens_q`.
+        cu_seqlens_q = [0]
+        # Number of uncached tokens in each sequence.
+        seqlens_k = []
+        # Cumulative sum of `seqlens_k`.
+        cu_seqlens_k = [0]
+        # Number of handled tokens in each sequence.
+        context_lens = []
+        # If there are cached token, then maps sequence index to cache block indexs.
+        block_tables = []
+        
+        for seq in seqs:
+            is_prefill = (seq.num_completion_tokens == 0)
+            
+            if is_prefill:
+                # Prefill phase.
+                num_cached_tokens = seq.num_cached_tokens
+                process_tokens = seq.token_ids[num_cached_tokens:]
+                q_len = len(process_tokens)
+                k_len = len(seq)
+                
+                input_ids.extend(process_tokens)
+                positions.extend(list(range(num_cached_tokens, len(seq))))
+
+                # Traverse the block table of sequence and convert block-level id into token-level id, that is `slot_mapping`.
+                # For example, if the size of 10th block is 256, then the 256 logical tokens belonging to this block have physical
+                # slots ranging from 10*256 to 10*256+255.
+                # The actual operation of storing the kv cache of each token is done by Triton kernel in `layers\attention.py`.
+                if seq.block_table:
+                    for i, block_id in enumerate(seq.block_table[seq.num_cached_blocks:]):
+                        # Check if the block is the last block of the sequence.
+                        if seq.num_cached_blocks+i != seq.num_blocks-1:
+                            slot_mapping.extend(list(range(block_id*self.block_size, (block_id+1)*self.block_size)))
+                        else:
+                            slot_mapping.extend(list(range(block_id*self.block_size, block_id*self.block_size+seq.last_block_num_tokens)))
+            else:
+                # Decode phase.
+                # Take a decode request as a prefill request with 1 query.
+                q_len = 1
+                k_len = len(seq)
+                
+                input_ids.append(seq.last_token)
+                positions.append(len(seq)-1)
+                slot_mapping.append(seq.block_table[-1]*self.block_size+seq.last_block_num_tokens-1)
+            
+            # Update length info of varied sequence.
+            seqlens_q.append(q_len)
+            seqlens_k.append(k_len)
+            cu_seqlens_q.append(cu_seqlens_q[-1]+q_len)
+            cu_seqlens_k.append(cu_seqlens_k[-1]+k_len)
+            context_lens.append(k_len)
+        
+        # Complete `block_tables` to pass them to Triton Kernel and FlashAttention.
+        all_block_tables = [seq.block_table for seq in seqs]
+        max_num_blocks = max(len(bt) for bt in all_block_tables)
+        for seq in seqs:
+            aligned_block_table = seq.block_table+[-1]*(max_num_blocks-len(seq.block_table))
+            block_tables.append(aligned_block_table)
+        
+        # Transfer data to GPU.
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        
+        # As long as there is a sequence with `q_len > 1`, we use the operator with variable length.
+        is_decode_only = all(seq.num_completion_tokens > 0 for seq in seqs)
+        
+        set_context(
+            is_prefill=not is_decode_only,
+            cu_seqlens_q=torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            cu_seqlens_k=torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            max_seqlen_q=max(seqlens_q, default=0),
+            max_seqlen_k=max(seqlens_k, default=0),
+            slot_mapping=torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
+            context_lens=torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+        )
+        
+        return input_ids, positions
+    
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_decode_only: bool):
         """
         Run model inference for a batch of sequences and return logits.
-        In decode phase, replaying CUDA graph to accelerate inference.
         
         Args:
             input_ids: Input token ids. shape: (total_tokens,)
             positions: Positions of each token. shape: (total_tokens,)
-            is_prefill: Whether it is prefill phase.
+            is_decode_only: Whether there is only decode requests in the batch.
         """
         
-        # In two cases, we can not use CUDA graph:
-        # (1) Prefill phase. In prefill phase, length and structure of sequence varies greatly,
-        #     but CUDA graph requires fixed computation graph and memory assess mode.
-        # (2) Enforce eager mode. CUDA graph does not support manual control flow.
-        if is_prefill or self.enforce_eager:
+        # Mixed batch has highly dynamic variabale tensor shape,
+        # but CUDA graph can not capture variable tensor shape.
+        # So, only when the batch is in pure decode phase and eager mode is not used, we can use CUDA graph.
+        if not is_decode_only or self.enforce_eager:
             logits = self.model.compute_logits(self.model(input_ids, positions))
-        # Use CUDA graph for decode phase.
         else:
             bs = input_ids.size(0)
             context = get_context()
@@ -465,21 +559,19 @@ class ModelRunner:
         return logits
     
     @torch.inference_mode()
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    def run(self, seqs: list[Sequence]) -> list[int]:
         """ Run model inference for a batch of sequences and return output token ids. """
         
         # Prepare the data for forward pass (prefill or decode).
-        # input_ids, positions shape: (total_tokens,)
-        if is_prefill:
-            input_ids, positions = self.prepare_prefill(seqs)
-        else:
-            input_ids, positions = self.prepare_decode(seqs)
-            
+        input_ids, positions = self.prepare_forward(seqs)
         # Prepare sampling temperatures.
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         
+        # Check if the batch is in pure decode phase.
+        is_decode_only = all(seq.num_completion_tokens > 0 for seq in seqs)
+        
         # Execute model inference.
-        logits = self.run_model(input_ids, positions, is_prefill)
+        logits = self.run_model(input_ids, positions, is_decode_only)
         
         # Sample tokens from logits.
         # Convert token ids to list of int, since sequence only supports int token ids.

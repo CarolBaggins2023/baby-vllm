@@ -83,7 +83,7 @@ class LLMEngine:
             return [], is_prefill
         
         # (2) Run the model.
-        outputs = self.model_runner.call('run', scheduled_sequences, is_prefill)
+        outputs = self.model_runner.call('run', scheduled_sequences)
         
         # (3) Postprocess the model outputs.
         self.scheduler.postprocess(scheduled_sequences, outputs)

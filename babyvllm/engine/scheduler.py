@@ -45,16 +45,59 @@ class Scheduler:
         seq.status = SequenceStatus.WAITING
         self.waiting.appendleft(seq)
     
-    def schedule(self) -> tuple[list[Sequence], bool]:
-        """ Schedule sequences. Allocate resources for scheduled sequences. """
+    def schedule(self) -> tuple[list[Sequence]]:
+        """
+        Schedule sequences. Allocate resources for scheduled sequences. 
+        Support continuous batching. Mix prefilling and decoding sequences in one scheduling.
+        """
         
         scheduled_sequences = []
         current_scheduled_tokens = 0
         
-        # Try schedule prefilling sequences from waiting queue.
-        while self.waiting and len(scheduled_sequences) < self.max_num_sequences:
+        # ======================
+        # (1) Try schedule decoding sequences from running queue.
+        # ======================
+        # Each scheduling of decoding sequence will generate 1 token, thus cost 1 token budget.
+        while self.running and len(scheduled_sequences) < self.max_num_sequences:
+            if current_scheduled_tokens >= self.max_num_batched_tokens:
+                    break
+            
+            seq = self.running.popleft()
+            
+            # If there is no free cache block, try to preempt other sequences.
+            # Preempting one running sequence may be not enough, so use `while` instead of `if`.
+            while not self.block_manager.can_append(seq):
+                if self.running:
+                    # If there are other running sequences, try to preempt the last one.
+                    self.preempt(self.running.pop())
+                else:
+                    # Otherwise, the sequence can not be scheduled.
+                    # It can only free its cached blocks and wait for the next scheduling.
+                    self.preempt(seq)
+                    break
+            else:
+                # Allocate resources for the sequence.
+                self.block_manager.append(seq)
+                # Manage the scheduled sequence.
+                scheduled_sequences.append(seq)
+                current_scheduled_tokens += 1
+        
+        # If successfully scheduled sequences, put them back to running queue in the same order.
+        if scheduled_sequences:
+            self.running.extendleft(reversed(scheduled_sequences))
+        
+        # ======================
+        # (2) Try schedule prefilling sequences from waiting queue using remaining token budget.
+        # ======================
+        remaining_seq_budget = self.max_num_sequences-len(scheduled_sequences)
+        scheduled_prefills = []
+        
+        while self.waiting and len(scheduled_prefills) < remaining_seq_budget:
             seq = self.waiting[0]
-            if self.block_manager.can_allocate(seq) and len(seq)+current_scheduled_tokens <= self.max_num_batched_tokens:
+            
+            # Check if remaining token budget is enough for the sequence,
+            # and if the block manager can allocate resources for the sequence.
+            if (len(seq)+current_scheduled_tokens <= self.max_num_batched_tokens) and self.block_manager.can_allocate(seq):
                 # Allocate resources for the sequence.
                 self.block_manager.allocate(seq)
                 seq.status = SequenceStatus.RUNNING
@@ -65,38 +108,15 @@ class Scheduler:
                 scheduled_sequences.append(seq)
                 current_scheduled_tokens += len(seq)
             else:
+                # Halt scheduling upon encountering the first prefill request,
+                # that cannot be accommodated within the remaining budget.
+                # It ensures the First Come First Serve order of prefill requests,
+                # preventing later short requests from cutting in line.
                 break
-        if scheduled_sequences:
-            return scheduled_sequences, True
+            
+        scheduled_sequences.extend(scheduled_prefills)
         
-        # Try schedule decoding sequences from running queue.
-        while self.running and len(scheduled_sequences) < self.max_num_sequences:
-            seq = self.running.popleft()
-            # If there is no free cache block, try to preempt other sequences.
-            # Preempting one running sequence may be not enough, so use `while` instead of `if`.
-            while not self.block_manager.can_append(seq):
-                # If there are other running sequences, try to preempt the last one.
-                if self.running:
-                    self.preempt(self.running.pop())
-                # Otherwise, the sequence can not be scheduled.
-                # It can only free its cached blocks and wait for the next scheduling.
-                else:
-                    self.preempt(seq)
-                    break
-            else:
-                if current_scheduled_tokens >= self.max_num_batched_tokens:
-                    break
-                # Allocate resources for the sequence.
-                self.block_manager.append(seq)
-                
-                # Manage the scheduled sequence.
-                scheduled_sequences.append(seq)
-                current_scheduled_tokens += 1
-        
-        # If successfully scheduled sequences, put them back to running queue in the same order.
-        if scheduled_sequences:
-            self.running.extendleft(reversed(scheduled_sequences))
-        return scheduled_sequences, False
+        return scheduled_sequences
     
     def postprocess(self, seqs: list[Sequence], token_ids: list[int]):
         """ Postprocess scheduled sequences. Append generated tokens to sequences and handle finished sequences. """

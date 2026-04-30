@@ -77,10 +77,10 @@ class LLMEngine:
         """ Run the model for scheduled sequences. """
         
         # (1) Schedule sequences.
-        scheduled_sequences, is_prefill = self.scheduler.schedule()
+        scheduled_sequences = self.scheduler.schedule()
         # There is no sequence to schedule.
         if not scheduled_sequences:
-            return [], is_prefill
+            return []
         
         # (2) Run the model.
         outputs = self.model_runner.call('run', scheduled_sequences)
@@ -90,9 +90,12 @@ class LLMEngine:
         
         # (4) Collect finished sequences.
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in scheduled_sequences if seq.is_finished]
-        num_processed_tokens = sum(len(seq) for seq in scheduled_sequences) if is_prefill else len(scheduled_sequences)
+        num_processed_tokens = sum(
+            1 if seq.num_completion_tokens > 0 else len(seq) 
+            for seq in scheduled_sequences
+        )
         
-        return outputs, num_processed_tokens, is_prefill
+        return outputs, num_processed_tokens
 
     def generate(
         self,
@@ -123,7 +126,7 @@ class LLMEngine:
             start_time = time.time()
             # Call scheduler and model runner to run the model.
             # outputs: {sequence id : generated tokens}
-            outputs, num_processed_tokens, is_prefill = self.step()
+            outputs, num_processed_tokens = self.step()
             end_time = time.time()
             
             # Collect metrics

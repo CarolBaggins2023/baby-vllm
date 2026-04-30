@@ -186,7 +186,7 @@ class ModelRunner:
         max_model_length = self.config.max_model_length
         batch_size = min(max_num_batched_tokens//max_model_length, self.config.max_num_sequences)
         seqs = [Sequence(token_ids=[0]*max_model_length) for _ in range(batch_size)]
-        self.run(seqs=seqs, is_prefill=True)
+        self.run(seqs=seqs)
         torch.cuda.empty_cache()
     
     def allocate_kv_cache(self):
@@ -294,128 +294,6 @@ class ModelRunner:
             outputs=outputs,
         )
     
-    def prepare_prefill(self, seqs: list[Sequence]) -> torch.Tensor:
-        """ Deprecated. Use `prepare_forward` instead. """
-        
-        
-        """ Prepare the data for prefill forward pass. """
-        
-        # All uncached token ids.
-        # shape: (sum of number of uncached tokens,)
-        input_ids = []
-        positions = []
-        # Where the cache of each uncached token should be written to.
-        # shape: (sum of number of uncached tokens,)
-        slot_mapping = []
-        
-        # Number of all tokens in each sequence, considering both cached and uncached tokens.
-        # shape: (number of sequences,)
-        seqlens_q = []
-        # Cumulative sum of `seqlens_q`.
-        # shape: (number of sequences + 1,)
-        cu_seqlens_q = [0]
-        # Number of uncached tokens in each sequence.
-        # shape: (number of sequences,)
-        seqlens_k = []
-        # Cumulative sum of `seqlens_k`.
-        # shape: (number of sequences + 1,)
-        cu_seqlens_k = [0]
-        
-        # If there are cached token, then maps sequence index to cache block indexs.
-        # shape: (number of sequences, max number of blocks per sequence)
-        # It can be None if there are no cached tokens.
-        block_tables = []
-        
-        for seq in seqs:
-            token_ids = seq.token_ids
-            num_cached_tokens = seq.num_cached_tokens
-            # Combining seperate sequences into a long sequence,
-            # which enables efficient processing with variable length sequences.
-            input_ids.extend(token_ids[num_cached_tokens:])
-            positions.extend(list(range(num_cached_tokens, len(seq))))
-            seqlens_q.append(len(token_ids)-num_cached_tokens)
-            seqlens_k.append(len(token_ids))
-            cu_seqlens_q.append(cu_seqlens_q[-1]+seqlens_q[-1])
-            cu_seqlens_k.append(cu_seqlens_k[-1]+seqlens_k[-1])
-            # Traverse the block table of sequence and convert block-level id into token-level id, that is `slot_mapping`.
-            # For example, if the size of 10th block is 256, then the 256 logical tokens belonging to this block have physical
-            # slots ranging from 10*256 to 10*256+255.
-            # The actual operation of storing the kv cache of each token is done by Triton kernel in `layers\attention.py`.
-            if seq.block_table:
-                for i, block_id in enumerate(seq.block_table[seq.num_cached_blocks:]):
-                    # Check if the block is the last block of the sequence.
-                    if seq.num_cached_blocks+i != seq.num_blocks-1:
-                        slot_mapping.extend(list(range(block_id*self.block_size, (block_id+1)*self.block_size)))
-                    else:
-                        slot_mapping.extend(list(range(block_id*self.block_size, block_id*self.block_size+seq.last_block_num_tokens)))
-
-        # The block table will be passed to Triton kernel. And Triton kernel requires all sequences have same number of blocks.
-        if cu_seqlens_q[-1] < cu_seqlens_k[-1]:
-            all_block_tables = [seq.block_table for seq in seqs]
-            max_num_blocks = max(len(block_table) for block_table in all_block_tables)
-            for seq in seqs:
-                aligned_block_table = seq.block_table+[-1]*(max_num_blocks-len(seq.block_table))
-                block_tables.append(aligned_block_table)
-        
-        # Allocate input token ids to pinned memory buffer, accelerating data transfer between host and device.
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        
-        set_context(
-            is_prefill=True,
-            cu_seqlens_q=torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-            cu_seqlens_k=torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-            max_seqlen_q=max(seqlens_q),
-            max_seqlen_k=max(seqlens_k),
-            slot_mapping=torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-            block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
-            context_lens=None,
-        )
-        
-        return input_ids, positions
-    
-    def prepare_decode(self, seqs: list[Sequence]) -> torch.Tensor:
-        """ Deprecated. Use `prepare_forward` instead. """
-        
-        
-        """ Prepare the data for decode forward pass. One token per sequence. """
-        
-        input_ids = []
-        positions = []
-        slot_mapping = []
-        block_tables = []
-        # Number of handled tokens in each sequence.
-        # shape: (number of sequences,)
-        context_lens = []
-        
-        for seq in seqs:
-            input_ids.append(seq.last_token)
-            positions.append(len(seq)-1)
-            context_lens.append(len(seq))
-            slot_mapping.append(seq.block_table[-1]*self.block_size+seq.last_block_num_tokens-1)
-        
-        all_block_tables = [seq.block_table for seq in seqs]
-        max_num_blocks = max(len(block_table) for block_table in all_block_tables)
-        for seq in seqs:
-            aligned_block_table = seq.block_table+[-1]*(max_num_blocks-len(seq.block_table))
-            block_tables.append(aligned_block_table)
-
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        
-        set_context(
-            is_prefill=False,
-            cu_seqlens_q=None,
-            cu_seqlens_k=None,
-            max_seqlen_q=0,
-            max_seqlen_k=0,
-            slot_mapping=torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-            block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
-            context_lens=torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-        )
-        
-        return input_ids, positions
-    
     def prepare_sample(self, seqs: list[Sequence]) -> torch.Tensor:
         """ Prepare sampling temperature for each sequence. """
         
@@ -492,9 +370,13 @@ class ModelRunner:
         # Complete `block_tables` to pass them to Triton Kernel and FlashAttention.
         all_block_tables = [seq.block_table for seq in seqs]
         max_num_blocks = max(len(bt) for bt in all_block_tables)
-        for seq in seqs:
-            aligned_block_table = seq.block_table+[-1]*(max_num_blocks-len(seq.block_table))
-            block_tables.append(aligned_block_table)
+        if max_num_blocks > 0:
+            for seq in seqs:
+                aligned_block_table = seq.block_table+[-1]*(max_num_blocks-len(seq.block_table))
+                block_tables.append(aligned_block_table)
+            block_tables_tensor = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        else:
+            block_tables_tensor = None
         
         # Transfer data to GPU.
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -510,7 +392,7 @@ class ModelRunner:
             max_seqlen_q=max(seqlens_q, default=0),
             max_seqlen_k=max(seqlens_k, default=0),
             slot_mapping=torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-            block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
+            block_tables=block_tables_tensor,
             context_lens=torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
         )
         

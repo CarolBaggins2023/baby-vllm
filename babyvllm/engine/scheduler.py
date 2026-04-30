@@ -45,7 +45,7 @@ class Scheduler:
         seq.status = SequenceStatus.WAITING
         self.waiting.appendleft(seq)
     
-    def schedule(self) -> tuple[list[Sequence]]:
+    def schedule(self) -> list[Sequence]:
         """
         Schedule sequences. Allocate resources for scheduled sequences. 
         Support continuous batching. Mix prefilling and decoding sequences in one scheduling.
@@ -105,7 +105,7 @@ class Scheduler:
                 # Manage the scheduled sequence.
                 self.waiting.popleft()
                 self.running.append(seq)
-                scheduled_sequences.append(seq)
+                scheduled_prefills.append(seq)
                 current_scheduled_tokens += len(seq)
             else:
                 # Halt scheduling upon encountering the first prefill request,

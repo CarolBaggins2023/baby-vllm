@@ -10,6 +10,8 @@ class SequenceStatus(Enum):
     WAITING = auto()
     RUNNING = auto()
     FINISHED = auto()
+    # The sequence is chunking the prompt, and generation has not yet begun.
+    CHUNKED_PREFILL = auto()
 
 class Sequence:
     """Sequence of tokens. It also records the related cached blocks.
@@ -32,6 +34,9 @@ class Sequence:
         self.num_tokens = len(self.token_ids)
         # When the sequence is created, it is filled with prompt tokens.
         self.num_prompt_tokens = len(self.token_ids)
+        # Number of tokens that have been processed through model forward propogation,
+        # and written to the kv cache.
+        self.num_computed_tokens = 0
         
         # `block_table` stores the physical block ids assigned by BlockManager to this sequence.
         # For example, if the sequence is divided into 3 logical blocks,
@@ -56,6 +61,17 @@ class Sequence:
     @property
     def is_finished(self):
         return self.status == SequenceStatus.FINISHED
+
+    @property
+    def is_chunked_prefill(self):
+        """ Whether the sequence is chunking the prompt, and generation has not yet begun. """
+        return 0 < self.num_computed_tokens < self.num_prompt_tokens
+    
+    @property
+    def get_uncomputed_token_ids(self):
+        if self.num_computed_tokens < self.num_prompt_tokens:
+            return self.token_ids[self.num_computed_tokens:self.num_prompt_tokens]
+        return []
     
     @property
     def num_completion_tokens(self):
@@ -102,14 +118,14 @@ class Sequence:
             self.num_tokens,
             self.num_prompt_tokens,
             self.num_cached_tokens,
+            self.num_computed_tokens,
             self.block_table,
             self.token_ids if self.num_completion_tokens == 0 else self.last_token
         )
     
     def __setstate__(self, state):
-        # `state` should be a tuple of
-        # (num_tokens, num_prompt_tokens, num_cached_tokens, block_table, last_token or token_ids)
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:-1]
+        # Strictly unpack in the order of `__getstate__`.
+        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_computed_tokens, self.block_table = state[:-1]
         
         # In prefill phase, all token ids should be restored.
         if self.num_completion_tokens == 0:

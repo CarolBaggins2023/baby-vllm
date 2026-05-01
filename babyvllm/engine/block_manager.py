@@ -1,6 +1,7 @@
 import xxhash
 from collections import deque
 import numpy as np
+import math
 
 from babyvllm.engine.sequence import Sequence
 
@@ -112,53 +113,6 @@ class BlockManager:
         self.free_block_ids.add(block_id)
         self.used_block_ids.remove(block_id)
     
-    def can_allocate(self, seq: Sequence) -> bool:
-        """
-        Check whether the block manager can allocate `num_blocks` blocks for the sequence.
-        """
-        return seq.num_blocks <= len(self.free_block_ids)
-    
-    def allocate(self, seq: Sequence):
-        # Initial hash value. -1 means no previous block.
-        h = -1
-        # The sequence needs `num_blocks` blocks to store all tokens,
-        # so the block manager needs to allocate `num_blocks` blocks for the sequence.
-        for i in range(seq.num_blocks):
-            # Get the token ids in range of i-th block of the sequence.
-            token_ids = seq.block(i)
-            # If the block is full, then compute the hash value of the block.
-            # Otherwise, set the hash value of the block to -1.
-            h = self.compute_hash(token_ids=token_ids, prefix_hash_value=h) if len(token_ids) == self.block_size else -1
-            # Fetch the block id from hash value to block id mapping.
-            # If the hash value is not found, then set the block id to -1, which means cache miss.
-            block_id = self.hash_to_block_id.get(h, -1)
-            cache_collision = block_id != -1 and self.blocks[block_id].token_ids != token_ids
-            # `block_id == -1` means cache miss.
-            # Both cache miss and hash collision means no cache found.
-            no_cache_found = block_id == -1 or cache_collision
-            
-            if not no_cache_found:
-                # Update sequence information.
-                seq.num_cached_tokens += self.block_size
-                
-                # Update block information.
-                if block_id in self.used_block_ids:
-                    block = self.blocks[block_id]
-                    block.ref_count += 1
-                # The block used to store this segment of token ids, but now it is not allocated.
-                else:
-                    block = self._allocate_block(block_id)
-            else:
-                block = self._allocate_block(self.free_block_ids[0])
-                block.update(h, token_ids)
-                # If the block is fulled filled, then record its hash value.
-                if h != -1:
-                    self.hash_to_block_id[h] = block.block_id
-            
-            # Record which blocks are used by the sequence.
-            # This information will be used to free blocks or append tokens to the block.
-            seq.block_table.append(block.block_id)
-    
     def deallocate(self, seq: Sequence):
         # Update block information.
         for block_id in seq.block_table:
@@ -170,40 +124,86 @@ class BlockManager:
         # Update sequence information.
         seq.block_table = []
         seq.num_cached_tokens = 0
-    
-    def can_append(self, seq: Sequence) -> bool:
-        """ Whether we can append a new token to the sequence. """
+
+    def can_allocate_chunk(self, seq: Sequence, chunk_size: int) -> bool:
+        """ Whether there is enough free blocks to accommodate `chunk_size` tokens. """
         
-        # If the sequence requires a new cache block, we need to check whether there are free blocks.
-        if seq.num_tokens%self.block_size == 1 and seq.num_tokens > 1:
-            return len(self.free_block_ids) > 0
-        # Otherwise, we can append a token to the sequence.
-        return True
-    
-    def append(self, seq: Sequence):
-        """
-        Manage the blocks of sequence when a new token is appended to the sequence.
-        There are three cases:
-        (1) The last cache block of the sequence used to have `block_size`-1 tokens, so its hash value is -1.
-            After a token is appended, the last cache block of the sequence will have `block_size` tokens, so it will have a valid hash value
-            and its hash value should be managed in hash table.
-        (2) The last cache block of the seqeunce was already fully filled.
-            After a token is appended, the last cache block will have `block_size`+1 tokens, which is out of limit.
-            So, a new cache block is needed to store the appended token of the sequence.
-        (3) The number of tokens in the last cache block of the sequence is less than `block_size`-1.
-            After a token is appended, the last cache block is still unfully filled.
-            So, the hash value of the last cache block remains -1 and the hash mapping remains not recorded.
-        """
+        current_blocks = len(seq.block_table)
+        target_blocks = math.ceil((seq.num_computed_tokens+chunk_size)/self.block_size)
+        num_new_blocks_needed = target_blocks-current_blocks
         
-        block_table = seq.block_table
-        last_block = self.blocks[block_table[-1]]
-        if seq.num_tokens%self.block_size == 0:
-            h = self.compute_hash(token_ids=seq.block(seq.num_blocks-1), prefix_hash_value=-1 if len(block_table) == 1 else self.blocks[block_table[-2]].hash)
-            last_block.update(h=h, token_ids=seq.block(seq.num_blocks-1))
-            self.hash_to_block_id[h] = last_block.block_id
-        elif seq.num_tokens%self.block_size == 1:
-            appended_block = self._allocate_block(self.free_block_ids[0])
-            block_table.append(appended_block.block_id)
-        else:
-            assert last_block.hash == -1
+        return num_new_blocks_needed <= len(self.free_block_ids)
+    
+    def allocate_chunk(self, seq: Sequence, chunk_size: int):
+        """ Allocate physical blocks of `chunk_size` tokens to the sequence. """
+        
+        # Token index range in the sequence.
+        start = seq.num_computed_tokens
+        end = start+chunk_size
+        
+        # Which logical blocks are needed to compute this chunk of tokens.
+        first_block_idx = start//self.block_size
+        last_block_idx = (end-1)//self.block_size
+        
+        # Allocate physical blocks.
+        for i in range(first_block_idx, last_block_idx+1):
+            # Whether we need to apply a new physical block.
+            is_new_block = (i>=len(seq.block_table))
             
+            # Whether this block will be fully filled.
+            # Only fully filled blocks will be managed in hash table,
+            # and participate in prefix caching.
+            is_full = (end>=(i+1)*self.block_size)
+            
+            block_start_token = i*self.block_size
+            block_end_token = min((i+1)*self.block_size, end)
+            token_ids = seq.token_ids[block_start_token:block_end_token]
+            
+            # ----- Compute Prefix Hash -----
+            if is_full:
+                # Chain hash: The hash of the current block depends on the hash of the previous block.
+                prefix_hash = self.blocks[seq.block_table[i-1]].hash if i > 0 else -1
+                h = self.compute_hash(token_ids=token_ids, prefix_hash_value=prefix_hash)
+            else:
+                h = -1
+            
+            # ----- Allocate and write physical block. -----
+            if is_new_block:
+                # If it is a new physical block, we need to execute complete
+                # allocation and cache reuse logic.
+                if is_full:
+                    # If the block is full, we need to execute cache reuse.
+                    # Fetch the block id from hash value to block id mapping.
+                    # If the hash value is not found, then set the block id to -1, which means cache miss.
+                    block_id = self.hash_to_block_id.get(h, -1)
+                    cache_collision = (block_id != -1) and (self.blocks[block_id].token_ids != token_ids)
+                    # `block_id == -1` means cache miss.
+                    # Both cache miss and hash collision means no cache found.
+                    no_cache_found = (block_id == -1) or cache_collision
+                    
+                    if not no_cache_found:
+                        # Cache hit.
+                        seq.num_cached_tokens += self.block_size
+                        block = self.blocks[block_id]
+                        if block_id in self.used_block_ids:
+                            block.ref_count += 1
+                        else:
+                            block = self._allocate_block(block_id)
+                    else:
+                        # Cache miss.
+                        block = self._allocate_block(self.free_block_ids[0])
+                        block.update(h, token_ids)
+                        self.hash_to_block_id[h] = block.block_id
+                else:
+                    # If the block is not full, we do not need to execute cache reuse.
+                    block = self._allocate_block(self.free_block_ids[0])
+                    block.update(h, token_ids)
+                
+                seq.block_table.append(block.block_id)
+            else:
+                # If it is not a new physical block, we just need to append new token.
+                block = self.blocks[seq.block_table[i]]
+                block.update(h, token_ids)
+                # If this append operation will make the block full, register the block id in hash table.
+                if is_full and h != -1:
+                    self.hash_to_block_id[h] = block.block_id

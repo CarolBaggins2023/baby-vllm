@@ -175,7 +175,7 @@ class BlockManager:
         """ Whether we can append a new token to the sequence. """
         
         # If the sequence requires a new cache block, we need to check whether there are free blocks.
-        if seq.num_tokens%self.block_size == 0:
+        if seq.num_tokens%self.block_size == 1 and seq.num_tokens > 1:
             return len(self.free_block_ids) > 0
         # Otherwise, we can append a token to the sequence.
         return True

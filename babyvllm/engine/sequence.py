@@ -37,6 +37,8 @@ class Sequence:
         # Number of tokens that have been processed through model forward propogation,
         # and written to the kv cache.
         self.num_computed_tokens = 0
+        # Record the amount of token budget allocated in the current scheduling step
+        self.chunk_size = 0
         
         # `block_table` stores the physical block ids assigned by BlockManager to this sequence.
         # For example, if the sequence is divided into 3 logical blocks,
@@ -119,13 +121,20 @@ class Sequence:
             self.num_prompt_tokens,
             self.num_cached_tokens,
             self.num_computed_tokens,
+            self.chunk_size,
             self.block_table,
             self.token_ids if self.num_completion_tokens == 0 else self.last_token
         )
     
     def __setstate__(self, state):
         # Strictly unpack in the order of `__getstate__`.
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_computed_tokens, self.block_table = state[:-1]
+        (self.num_tokens,
+         self.num_prompt_tokens, 
+         self.num_cached_tokens, 
+         self.num_computed_tokens,
+         self.chunk_size,
+         self.chunk_size,
+         self.block_table) = state[:-1]
         
         # In prefill phase, all token ids should be restored.
         if self.num_completion_tokens == 0:

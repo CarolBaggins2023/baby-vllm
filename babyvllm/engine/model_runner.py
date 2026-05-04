@@ -305,71 +305,77 @@ class ModelRunner:
     
     def prepare_forward(self, seqs: list[Sequence]) -> torch.Tensor:
         """
-        Unified data preparation for both prefill, decode, and mixed batches.
+        Unified data preparation for both prefill, chunked prefill, decode, and mixed batches.
         """
-        
-        # All uncached token ids and their positions.
+
+        # All tokens and their positions that will be passed to the model for forward pass.
         input_ids = []
         positions = []
-        # Where the cache of each uncached token should be written to.
-        slot_mapping = []
-        # Number of all tokens in each sequence.
-        seqlens_q = []
-        # Cumulative sum of `seqlens_q`.
-        cu_seqlens_q = [0]
-        # Number of uncached tokens in each sequence.
-        seqlens_k = []
-        # Cumulative sum of `seqlens_k`.
-        cu_seqlens_k = [0]
-        # Number of handled tokens in each sequence.
-        context_lens = []
-        # If there are cached token, then maps sequence index to cache block indexs.
-        block_tables = []
         
+        # Assume there are three sequences in the current batch:
+        # Seq0: Prefill phase. Just start computing. chunk_size = 256.
+        # Seq1: Chunked-prefill phase. Already computed 100 tokens, now computing 50 tokens. chunk_size = 50.
+        # Seq2: Decode phase. Already computed 1000 tokens, now computing 1 token. chunk_size = 1.
+        # Number of tokens in each sequence that will participate in attention,
+        # which is the number of `query` of each sequence and equals to `chunk_size`.
+        # [256, 50, 1]
+        seqlens_q = []
+        # Prefix sum of `seqlens_q`.
+        # [0, 256, 306, 307]
+        cu_seqlens_q = [0]
+        # Number of previous tokens in each sequence that each `query` will attend to,
+        # which is the number of `key` of each sequence and equals to `already_computed_tokens+chunk_size`.
+        # [256, 150, 1001]
+        seqlens_k = []
+        # Prefix sum of `seqlens_k`.
+        # [0, 256, 406, 1407]
+        cu_seqlens_k = [0]
+        
+        # Number of tokens that have been stored in kv cache for each sequence.
+        # [256, 150, 1001]
+        context_lens = []
+        
+        # The two-dimensional matrix after padding the `seq.block_table` of each sequence.
+        # When calculating attention, when the operator needs to find the Nth historical token,
+        # it will use `block_tables` to check the physical memory.
+        block_tables = []
+        # The specific location of physical memory (`allocated_kv_cache`)
+        # where the KV of tokens in `input_ids` should be written to.
+        # This is an array of the same length as `input_ids`.
+        # In Triton operator `store_kvcache`, the GPU will store the calculated KV
+        # in the slot indicated by `slot_mapping` (physical block number*block size+offset within block).
+        slot_mapping = []
+    
         for seq in seqs:
-            is_prefill = (seq.num_completion_tokens == 0)
+            start_idx = seq.num_computed_tokens
+            chunk_size = seq.chunk_size
+            end_idx = start_idx+chunk_size
             
-            if is_prefill:
-                # Prefill phase.
-                num_cached_tokens = seq.num_cached_tokens
-                process_tokens = seq.token_ids[num_cached_tokens:]
-                q_len = len(process_tokens)
-                k_len = len(seq)
-                
-                input_ids.extend(process_tokens)
-                positions.extend(list(range(num_cached_tokens, len(seq))))
-
-                # Traverse the block table of sequence and convert block-level id into token-level id, that is `slot_mapping`.
-                # For example, if the size of 10th block is 256, then the 256 logical tokens belonging to this block have physical
-                # slots ranging from 10*256 to 10*256+255.
-                # The actual operation of storing the kv cache of each token is done by Triton kernel in `layers\attention.py`.
-                if seq.block_table:
-                    for i, block_id in enumerate(seq.block_table[seq.num_cached_blocks:]):
-                        # Check if the block is the last block of the sequence.
-                        if seq.num_cached_blocks+i != seq.num_blocks-1:
-                            slot_mapping.extend(list(range(block_id*self.block_size, (block_id+1)*self.block_size)))
-                        else:
-                            slot_mapping.extend(list(range(block_id*self.block_size, block_id*self.block_size+seq.last_block_num_tokens)))
-            else:
-                # Decode phase.
-                # Take a decode request as a prefill request with 1 query.
-                q_len = 1
-                k_len = len(seq)
-                
-                input_ids.append(seq.last_token)
-                positions.append(len(seq)-1)
-                slot_mapping.append(seq.block_table[-1]*self.block_size+seq.last_block_num_tokens-1)
+            # 1. Get tokens and their positions that will participate in attention.
+            process_tokens = seq.token_ids[start_idx:end_idx]
+            input_ids.extend(process_tokens)
+            positions.extend(list(range(start_idx, end_idx)))
             
-            # Update length info of varied sequence.
-            seqlens_q.append(q_len)
+            # 2. Length information in attention, which is important for FlashAttention.
+            q_len = chunk_size
+            k_len = end_idx
+            
+            seqlens_q.qppend(q_len)
             seqlens_k.append(k_len)
             cu_seqlens_q.append(cu_seqlens_q[-1]+q_len)
             cu_seqlens_k.append(cu_seqlens_k[-1]+k_len)
             context_lens.append(k_len)
+            
+            # 3. Which physical memory location should be used to store the tokens.
+            for logical_idx in range(start_idx, end_idx):
+                block_idx = logical_idx//self.block_size
+                block_offset = logical_idx%self.block_size
+                physical_block_id = seq.block_table[block_idx]
+                slot_mapping.append(physical_block_id*self.block_size+block_offset)
         
-        # Complete `block_tables` to pass them to Triton Kernel and FlashAttention.
+        # Fill in `block_tables` to pass in Triton Kernel and FlashAttention to access historical KV.    
         all_block_tables = [seq.block_table for seq in seqs]
-        max_num_blocks = max(len(bt) for bt in all_block_tables)
+        max_num_blocks = max((len(bt) for bt in all_block_tables), default=0)
         if max_num_blocks > 0:
             for seq in seqs:
                 aligned_block_table = seq.block_table+[-1]*(max_num_blocks-len(seq.block_table))
@@ -378,11 +384,13 @@ class ModelRunner:
         else:
             block_tables_tensor = None
         
+        
         # Transfer data to GPU.
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         
-        # As long as there is a sequence with `q_len > 1`, we use the operator with variable length.
+        # Only when all sequences are in the decode phase, this batch can be counted as `is_decode_only`.
+        # (used to trigger CUDA Graph)
         is_decode_only = all(seq.num_completion_tokens > 0 for seq in seqs)
         
         set_context(

@@ -4,7 +4,7 @@ import triton
 import triton.language as tl
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
-from babyvllm.utils import get_context
+from babyvllm.utils import Context, get_context
 
 
 @triton.jit
@@ -140,6 +140,54 @@ class Attention(nn.Module):
         self.v_cache = torch.tensor([])
         
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        context: Context = get_context()
+        k_cache = self.k_cache
+        v_cache = self.v_cache
+        
+        # ============================================
+        # 1. Seperation of storage and computation.
+        # ============================================
+        # Once KV cache is enabled, we should first store the key and value tensors
+        # into the physical cache (`k_cache` and `v_cache`), according to `slot_mapping`.
+        if k_cache.numel() and v_cache.numel() and context.slot_mapping is not None:
+            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+        
+        # ============================================
+        # 2. Unified attention calculation.
+        # ============================================
+        if context.is_prefill:
+            # Prefill or chunked prefill phase.
+            if context.block_tables is not None:
+                # When calculating Attention, we no longer use the incoming local k and v.
+                # But instead, the entire physical memory (`k_cache` and `v_cache`) is directly passed to the operator.
+                # The operator will combine historical memory and new memory together,
+                # according to `context_lens` and `block_tables`.
+                attn_k, attn_v = k_cache, v_cache
+            else:
+                # Fallback: Default logic when KV cache is not enabled.
+                attn_k, attn_v = k, v
+            
+            # `flash_attn_varlen_func` is the attention operator which can handle `q_len != k_len` case.
+            o = flash_attn_varlen_func(
+                q, attn_k, attn_v,
+                max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
+                max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
+                softmax_scale=self.scale, causal=True, block_table=context.block_tables,
+            )
+        else:
+            # Decode phase.
+            # `flash_attn_with_kvcache` is the attention operator which is optimized for batched decode
+            # and is much faster than `flash_attn_varlen_func`.
+            o = flash_attn_with_kvcache(
+                q.unsqueeze(1), k_cache, v_cache,
+                cache_seqlens=context.context_lens, block_table=context.block_tables,
+                softmax_scale=self.scale, causal=True,
+            )
+            o = o.squeeze(1)
+        
+        return o
+        
+    def forward_old(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         context = get_context()
         k_cache = self.k_cache
         v_cache = self.v_cache

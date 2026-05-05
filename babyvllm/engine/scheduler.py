@@ -42,6 +42,8 @@ class Scheduler:
         """ Preempt a sequence. Deallocate its cached blocks and put it back to waiting queue. """
         
         self.block_manager.deallocate(seq)
+        # Reset the computation progress of the preempted sequence.
+        seq.num_computed_tokens = 0
         seq.status = SequenceStatus.WAITING
         self.waiting.appendleft(seq)
     
@@ -49,8 +51,8 @@ class Scheduler:
         """ Get the maximum token budget that can be allocated to this sequence. """
         
         # Limit 1: Cannot allocate more tokens than uncomputed tokens.
+        uncomputed = seq.num_tokens-seq.num_computed_tokens
         # Limit 2: Cannot allocate more tokens than remaining budget.
-        uncomputed = seq.num_prompt_tokens-seq.num_computed_tokens
         chunk_size = min(uncomputed, remaining_budget)
         
         # Limit 3: Cannot allocate more tokens than remaining physical memory.
@@ -68,6 +70,21 @@ class Scheduler:
         Schedule sequences. Allocate resources for scheduled sequences. 
         Support continuous batching. Mix prefilling and decoding sequences in one scheduling.
         Support chunked prefilling.
+        
+        Why use `seq.num_tokens` instead of `seq.num_prompt_tokens` in many judgements?
+        Suppose the initial prompt length sent by the user is 100.
+        [Phase 1: Normal Chunked Prefill (e.g., chunk by 60)]
+        - Step 1: num_computed_tokens=0,  num_tokens=100 -> need 100 more -> compute 60 tokens
+        - Step 2: num_computed_tokens=60, num_tokens=100 -> need 40 more  -> compute 40 tokens, then output token 101 and append
+        [Phase 2: Normal Decode]
+        - Step 3: num_computed_tokens=100, num_tokens=101 -> need 1 more   -> Decode operator, output token 102 and append
+        - Step 4: num_computed_tokens=101, num_tokens=102 -> need 1 more   -> Decode operator, output token 103 and append
+        [Phase 3: Critical Preemption Recovery]
+        - Assume after computing token 103, it gets preempted due to memory pressure.
+        - During recovery, its KV cache is cleared and num_computed_tokens is reset to 0.
+        - Current state: num_computed_tokens=0, num_tokens=103.
+        - If using num_prompt_tokens(100): need 100-0=100. Only first 100 tokens are recovered, last 3 tokens lost forever, system crashes.
+        - If using num_tokens(103): need 103-0=103. System treats generated 3 tokens as prompt and also recovers them.
         """
         
         scheduled_sequences = []
@@ -85,7 +102,7 @@ class Scheduler:
             
             seq: Sequence = self.running.popleft()
             
-            if seq.num_computed_tokens < seq.num_prompt_tokens:
+            if seq.num_computed_tokens < seq.num_tokens-1:
                 # The sequence is in chunked prefilling phase.
                 remaining_budget = self.max_num_batched_tokens-current_scheduled_tokens
                 chunk_size = self._get_max_chunk_size(seq, remaining_budget)
@@ -186,25 +203,18 @@ class Scheduler:
             seq.num_computed_tokens += chunk_size
             
             # ======================
-            # (2) Append the token to the sequence.
+            # (2) Append the token to the sequence and check if the sequence is finished.
+            # (only if the prompt has been computed already).
             # ======================
-            if seq.num_computed_tokens >= seq.num_prompt_tokens:
+            if seq.num_computed_tokens >= seq.num_tokens:
                 # The sequence has finished prefilling phase or it is already in decoding phase.
                 seq.append_token(token_id)
-            else:
-                # The sequence is still in chunked prefilling phase.
-                # Ignore its output token.
-                pass
-            
-            # ======================
-            # (3) Check if the sequence is finished (only if the prompt has been computed already).
-            # ======================
-            if seq.num_computed_tokens >= seq.num_prompt_tokens:
+                
                 # In following cases, a sequence will stop append new tokens:
                 # (a) The eos token is generated.
                 stop_check_eos = not seq.ignore_eos and token_id == self.eos
                 # (b) The number of completion tokens exceeds the limit.
-                stop_check_max_completion = 1+seq.num_completion_tokens >= seq.max_tokens
+                stop_check_max_completion = seq.num_completion_tokens >= seq.max_tokens
                 # (c) The sequence length exceeds the maximum model length.
                 stop_check_max_model_len = seq.max_model_length is not None and len(seq) >= seq.max_model_length
                 
@@ -212,4 +222,8 @@ class Scheduler:
                     seq.status = SequenceStatus.FINISHED
                     self.block_manager.deallocate(seq)
                     self.running.remove(seq)
+            else:
+                # The sequence is still in chunked prefilling phase.
+                # Ignore its output token.
+                pass
     

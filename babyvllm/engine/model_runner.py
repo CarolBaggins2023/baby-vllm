@@ -172,7 +172,8 @@ class ModelRunner:
                 # Do not need second `exit()` call.
                 # self.exit()
                 break
-        
+    
+    @torch.inference_mode()
     def warmup_model(self):
         """ Warmup the model and record the peak memory usage. """
         
@@ -181,12 +182,31 @@ class ModelRunner:
         # Reset peak memory usage stats.
         torch.cuda.reset_peak_memory_stats()
         
-        # Create a batch of fake sequences and run the model.
-        max_num_batched_tokens = self.config.max_num_batched_tokens
-        max_model_length = self.config.max_model_length
-        batch_size = min(max_num_batched_tokens//max_model_length, self.config.max_num_sequences)
-        seqs = [Sequence(token_ids=[0]*max_model_length) for _ in range(batch_size)]
-        self.run(seqs=seqs)
+        # Construct test data: Fill the engine to its maximum token capacity in a single batch.
+        num_tokens = self.config.max_num_batched_tokens
+        input_ids = torch.zeros(num_tokens, dtype=torch.int64, device=f'cuda:{self.rank}')
+        positions = torch.arange(
+            num_tokens, dtype=torch.int64, device=f'cuda:{self.rank}'
+        )%self.config.max_model_length
+        
+        # Bypass the complex logic of `prepare_forward` and manually inject the Context.
+        # Due to the lack of allocation of `slot_mapping` and `block_tables`,
+        # the attention will enter cache free mode
+        set_context(
+            is_prefill=True,
+            cu_seqlens_q=torch.tensor([0, num_tokens], dtype=torch.int32, device=f'cuda:{self.rank}'),
+            cu_seqlens_k=torch.tensor([0, num_tokens], dtype=torch.int32, device=f'cuda:{self.rank}'),
+            max_seqlen_q=num_tokens,
+            max_seqlen_k=num_tokens,
+            slot_mapping=None,
+            block_tables=None,
+            context_lens=None,
+        )
+        
+        # Directly call the model for forward pass.
+        self.model(input_ids, positions)
+        
+        reset_context()
         torch.cuda.empty_cache()
     
     def allocate_kv_cache(self):
@@ -360,7 +380,7 @@ class ModelRunner:
             q_len = chunk_size
             k_len = end_idx
             
-            seqlens_q.qppend(q_len)
+            seqlens_q.append(q_len)
             seqlens_k.append(k_len)
             cu_seqlens_q.append(cu_seqlens_q[-1]+q_len)
             cu_seqlens_k.append(cu_seqlens_k[-1]+k_len)
@@ -391,7 +411,7 @@ class ModelRunner:
         
         # Only when all sequences are in the decode phase, this batch can be counted as `is_decode_only`.
         # (used to trigger CUDA Graph)
-        is_decode_only = all(seq.num_completion_tokens > 0 for seq in seqs)
+        is_decode_only = all(seq.num_computed_tokens >= seq.num_prompt_tokens for seq in seqs)
         
         set_context(
             is_prefill=not is_decode_only,
@@ -458,7 +478,7 @@ class ModelRunner:
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         
         # Check if the batch is in pure decode phase.
-        is_decode_only = all(seq.num_completion_tokens > 0 for seq in seqs)
+        is_decode_only = all(seq.num_computed_tokens >= seq.num_prompt_tokens for seq in seqs)
         
         # Execute model inference.
         logits = self.run_model(input_ids, positions, is_decode_only)

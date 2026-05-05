@@ -28,7 +28,7 @@ class Block:
     def reset(self):
         self.token_ids = []
         self.hash = -1
-        self.ref_count = 0
+        self.ref_count = 1
         
 class BlockManager:
     """
@@ -110,7 +110,7 @@ class BlockManager:
         block = self.blocks[block_id]
         assert block.ref_count == 0, f"Block {block_id} cannot be deallocated because it is referenced by {block.ref_count} seqeuences."
         block.token_ids = []
-        self.free_block_ids.add(block_id)
+        self.free_block_ids.append(block_id)
         self.used_block_ids.remove(block_id)
     
     def deallocate(self, seq: Sequence):

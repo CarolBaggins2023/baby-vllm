@@ -4,6 +4,7 @@ from dataclasses import fields
 import torch
 import torch.multiprocessing as mp
 from transformers import AutoTokenizer
+import numpy as np
 
 from babyvllm.config import Config
 from babyvllm.engine.sequence import Sequence
@@ -68,19 +69,33 @@ class LLMEngine:
         for process in self.processes:
             process.join()
 
-    def add_request(self, prompt: str, sampling_params: SamplingParams):
-        """ Add input prompt to the scheduler's waiting queue. """
+    def add_request(
+        self,
+        sampling_params: SamplingParams,
+        prompt: str = None,
+        prompt_token_ids: list[int] = None,
+    ):
+        """
+        Add input prompt to the scheduler's waiting queue.
+        Support both `string` format and `list[int]` format.
+        """
         
-        self.scheduler.add_sequence(Sequence(token_ids=self.tokenizer.encode(prompt), sampling_params=sampling_params))
+        if prompt_token_ids is None:
+            if prompt is None:
+                raise ValueError("Either prompt or prompt_token_ids must be provided.")
+            prompt_token_ids = self.tokenizer.encode(prompt)
+        
+        seq = Sequence(token_ids=prompt_token_ids, sampling_params=sampling_params)
+        self.scheduler.add_sequence(seq)
 
-    def step(self) -> tuple[list[int], int, bool]:
+    def step(self) -> tuple[list[int], int]:
         """ Run the model for scheduled sequences. """
         
         # (1) Schedule sequences.
         scheduled_sequences = self.scheduler.schedule()
         # There is no sequence to schedule.
         if not scheduled_sequences:
-            return []
+            return [], 0
         
         # (2) Run the model.
         outputs = self.model_runner.call('run', scheduled_sequences)
@@ -99,15 +114,22 @@ class LLMEngine:
 
     def generate(
         self,
-        prompts: list[str],
-        sampling_params: SamplingParams,
-        print_log: bool = False,
-    ) -> list[str]:
+        prompts: list[str] | list[list[int]],
+        sampling_params: SamplingParams | list[SamplingParams],
+    ) -> tuple[list[str], dict]:
         """ Generate text for all input prompts. """
-        
+
+        if not isinstance(sampling_params, list):
+            sampling_params = [sampling_params]*len(prompts)
+
         # Add all input prompts to the scheduler's waiting queue.
-        for prompt in prompts:
-            self.add_request(prompt, sampling_params)
+        for prompt_data, sp in zip(prompts, sampling_params):
+            if isinstance(prompt_data, str):
+                self.add_request(sampling_params=sp, prompt=prompt_data)
+            elif isinstance(prompt_data, list):
+                self.add_request(sampling_params=sp, prompt_token_ids=prompt_data)
+            else:
+                raise ValueError("Prompts must be a list of strings or a list of token ID lists.")
         
         # {sequence id : generated tokens}
         generated_tokens = {}
@@ -174,22 +196,27 @@ class LLMEngine:
                     total_gen_time = inference_end_time - first_token_times[seq_id]
                     tpot = total_gen_time / sequence_token_counts[seq_id] if sequence_token_counts[seq_id] > 0 else 0
                     tpot_values.append(tpot)
-        average_ttft = sum(ttft_values)/len(ttft_values) if ttft_values else 0
-        average_tpot = sum(tpot_values)/len(tpot_values) if tpot_values else 0
         
-        
-        # Print metrics
-        if print_log:
-            print(f"\n=== Inference Metrics ===")
-            print(f"Total tokens processed: {total_tokens}")
-            print(f"Total inference time: {total_inference_time:.4f} seconds")
-            print(f"Average throughput: {average_throughput:.2f} tokens/second")
-            print(f"Average memory usage: {average_memory:.2f} MB")
-            print(f"Average GPU utilization: {average_gpu_util:.2f}%")
-            print(f"Average TTFT: {average_ttft:.4f} seconds")
-            print(f"Average TPOT: {average_tpot:.4f} seconds/token")
-
-            print("========================\n")
+        metrics = {
+            "total_tokens": total_tokens,
+            "total_time": total_inference_time,
+            "throughput": average_throughput,
+            "avg_memory_mb": average_memory,
+            "avg_gpu_util": average_gpu_util,
+            "ttft": {
+                "avg": np.mean(ttft_values) if ttft_values else 0,
+                "p50": np.percentile(ttft_values, 50) if ttft_values else 0,
+                "p90": np.percentile(ttft_values, 90) if ttft_values else 0,
+                "p99": np.percentile(ttft_values, 99) if ttft_values else 0,
+            },
+            "tpot": {
+                "avg": np.mean(tpot_values) if tpot_values else 0,
+                "p50": np.percentile(tpot_values, 50) if tpot_values else 0,
+                "p90": np.percentile(tpot_values, 90) if tpot_values else 0,
+                "p99": np.percentile(tpot_values, 99) if tpot_values else 0,
+            }
+        }
         
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in generated_tokens]
-        return outputs
+        
+        return outputs, metrics

@@ -411,7 +411,7 @@ class ModelRunner:
         
         # Only when all sequences are in the decode phase, this batch can be counted as `is_decode_only`.
         # (used to trigger CUDA Graph)
-        is_decode_only = all(seq.num_computed_tokens >= seq.num_prompt_tokens for seq in seqs)
+        is_decode_only = all(seq.num_computed_tokens > 0 and seq.num_computed_tokens == seq.num_tokens-1 for seq in seqs)
         
         set_context(
             is_prefill=not is_decode_only,
@@ -478,7 +478,7 @@ class ModelRunner:
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         
         # Check if the batch is in pure decode phase.
-        is_decode_only = all(seq.num_computed_tokens >= seq.num_prompt_tokens for seq in seqs)
+        is_decode_only = all(seq.num_computed_tokens > 0 and seq.num_computed_tokens == seq.num_tokens-1 for seq in seqs)
         
         # Execute model inference.
         logits = self.run_model(input_ids, positions, is_decode_only)

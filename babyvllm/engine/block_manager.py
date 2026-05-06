@@ -27,7 +27,7 @@ class Block:
     def reset(self):
         self.token_ids = []
         self.hash = -1
-        self.ref_count = 0
+        self.ref_count = 1
         
 class BlockManager:
     """
@@ -109,7 +109,7 @@ class BlockManager:
         block = self.blocks[block_id]
         assert block.ref_count == 0, f"Block {block_id} cannot be deallocated because it is referenced by {block.ref_count} seqeuences."
         block.token_ids = []
-        self.free_block_ids.add(block_id)
+        self.free_block_ids.append(block_id)
         self.used_block_ids.remove(block_id)
     
     def can_allocate(self, seq: Sequence) -> bool:
@@ -180,7 +180,7 @@ class BlockManager:
         """ Whether we can append a new token to the sequence. """
         
         # If the sequence requires a new cache block, we need to check whether there are free blocks.
-        if seq.num_tokens%self.block_size == 0:
+        if seq.num_tokens%self.block_size == 1:
             return len(self.free_block_ids) > 0
         # Otherwise, we can append a token to the sequence.
         return True

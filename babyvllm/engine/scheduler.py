@@ -81,6 +81,7 @@ class Scheduler:
                     break
             else:
                 if current_scheduled_tokens >= self.max_num_batched_tokens:
+                    self.running.appendleft(seq)
                     break
                 # Allocate resources for the sequence.
                 self.block_manager.append(seq)
@@ -104,7 +105,7 @@ class Scheduler:
             # (1) The eos token is generated.
             stop_check_eos = not seq.ignore_eos and token_id == self.eos
             # (2) The number of completion tokens exceeds the limit.
-            stop_check_max_completion = 1+seq.num_completion_tokens >= seq.max_tokens
+            stop_check_max_completion = seq.num_completion_tokens >= seq.max_tokens
             # (3) The sequence length exceeds the maximum model length.
             stop_check_max_model_len = seq.max_model_length is not None and len(seq) >= seq.max_model_length
             

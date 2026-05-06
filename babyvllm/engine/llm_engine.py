@@ -74,21 +74,23 @@ class LLMEngine:
         sampling_params: SamplingParams,
         prompt: str = None,
         prompt_token_ids: list[int] = None,
-    ):
+    ) -> int:
         """
         Add input prompt to the scheduler's waiting queue.
         Support both `string` format and `list[int]` format.
+        Return the number of tokens in the prompt.
         """
         
         if prompt_token_ids is None:
             if prompt is None:
                 raise ValueError("Either prompt or prompt_token_ids must be provided.")
             prompt_token_ids = self.tokenizer.encode(prompt)
-            
+        
         seq = Sequence(token_ids=prompt_token_ids, sampling_params=sampling_params)
         self.scheduler.add_sequence(seq)
+        return len(prompt_token_ids)
 
-    def step(self) -> tuple[list[int], int, bool]:
+    def step(self):
         """ Run the model for scheduled sequences. """
         
         # (1) Schedule sequences.
@@ -105,9 +107,8 @@ class LLMEngine:
         
         # (4) Collect finished sequences.
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in scheduled_sequences if seq.is_finished]
-        num_processed_tokens = sum(len(seq) for seq in scheduled_sequences) if is_prefill else len(scheduled_sequences)
         
-        return outputs, num_processed_tokens, is_prefill
+        return outputs, is_prefill
 
     def generate(
         self,
@@ -120,11 +121,12 @@ class LLMEngine:
             sampling_params = [sampling_params]*len(prompts)
             
         # Add all input prompts to the scheduler's waiting queue.
+        prompt_tokens_cnt = 0
         for prompt_data, sp in zip(prompts, sampling_params):
             if isinstance(prompt_data, str):
-                self.add_request(sampling_params=sp, prompt=prompt_data)
+                prompt_tokens_cnt += self.add_request(sampling_params=sp, prompt=prompt_data)
             elif isinstance(prompt_data, list):
-                self.add_request(sampling_params=sp, prompt_token_ids=prompt_data)
+                prompt_tokens_cnt += self.add_request(sampling_params=sp, prompt_token_ids=prompt_data)
             else:
                 raise ValueError("Prompts must be a list of strings or a list of token ID lists.")
                 
@@ -132,7 +134,6 @@ class LLMEngine:
         generated_tokens = {}
         
         # Metrics collection
-        total_tokens = 0
         total_time = 0
         memory_usages = []
         gpu_utilizations = []
@@ -145,11 +146,10 @@ class LLMEngine:
             start_time = time.time()
             # Call scheduler and model runner to run the model.
             # outputs: {sequence id : generated tokens}
-            outputs, num_processed_tokens, is_prefill = self.step()
+            outputs, is_prefill = self.step()
             end_time = time.time()
             
             # Collect metrics
-            total_tokens += num_processed_tokens
             step_time = end_time-start_time
             total_time += step_time
             
@@ -177,7 +177,9 @@ class LLMEngine:
         # Calculate metrics
         inference_end_time = time.time()
         total_inference_time = inference_end_time-inference_start_time
-        average_throughput = total_tokens/total_inference_time if total_inference_time > 0 else 0
+        generated_tokens_cnt = sum(sequence_token_counts.values())
+        total_tokens_cnt = prompt_tokens_cnt + generated_tokens_cnt
+        average_throughput = total_tokens_cnt/total_inference_time if total_inference_time > 0 else 0
         average_memory = sum(memory_usages)/len(memory_usages) if memory_usages else 0
         average_gpu_util = sum(gpu_utilizations)/len(gpu_utilizations) if gpu_utilizations else 0
 
@@ -195,7 +197,7 @@ class LLMEngine:
                     tpot_values.append(tpot)
 
         metrics = {
-            "total_tokens": total_tokens,
+            "total_tokens": total_tokens_cnt,
             "total_time": total_inference_time,
             "throughput": average_throughput,
             "avg_memory_mb": average_memory,

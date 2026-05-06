@@ -24,7 +24,7 @@ def llm_generate():
         model=path, 
         enforce_eager=False, 
         tensor_parallel_size=1,
-        max_num_batched_tokens=2048,
+        max_num_batched_tokens=4096,
         max_num_sequences=256
     )
 

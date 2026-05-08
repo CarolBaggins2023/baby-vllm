@@ -4,7 +4,7 @@ from dataclasses import dataclass
 @dataclass
 class Context:
     is_prefill: bool = False
-    
+
     # `cu_seqlens_q` is the cumulative sequence lengths, considering both cached and uncached tokens.
     # For example, suppose there are 3 sequences, with length 2, 3, and 5:
     # Sequence 0: [token 0, token 1]
@@ -30,23 +30,23 @@ class Context:
     cu_seqlens_k: torch.Tensor|None = None
     # `max_seqlen_k` is the maximum sequence length, considering only uncached tokens.
     max_seqlen_k: int = 0
-    
+
     # `slot_mapping` maps token index to slot index in cache block. sequence <-> cache block
     # `block_tables` maps sequence index to cache block indexs. token <-> slot in cache block
-    
+
     # 1-dimension tensor, with shape of (num_tokens,).
     # It maps token index to cache slot index and maps padded token to -1.
     # For example, there are token 0, token 1 and padded token 2 and padded token 3.
     # If token 0 is written at cache slot 0, token 1 is written at cache slot 1,
     # `slot_mapping` should be [0, 1, -1, -1].
     slot_mapping: torch.Tensor|None = None
-    
+
     # 2-dimension tensor, with shape of (num_sequences, num_blocks_per_sequence).
     # It maps sequence index to cache block indexs.
     # For examples, if Sequence 0 use Cache Block 0 and Cache Block 1, Sequence 1 use Cache Block 2,
     # then `block_tables` should be [[0, 1], [2]].
     block_tables: torch.Tensor|None = None
-    
+
     # 1-dimension tensor, with shape of (num_sequences,).
     # It records the number of handled tokens (prompt length in prefill,
     # or generated length in decode) in each sequence.
@@ -55,6 +55,25 @@ class Context:
     # After prefilling and before first decoding, `context_lens` is still [5, 3].
     # After first deocoding and before second decoding, `context_lens` becomes [6, 4].
     context_lens: torch.Tensor|None = None
+
+    # ============================================================
+    # Fields for mixed batch reordering.
+    # ============================================================
+    # After reordering, Decode sequences (q_len=1) are placed before Prefill sequences (q_len>1).
+    # The following two fields record the "split point" in the merged token array.
+
+    # Number of Decode sequences in the batch (those with chunk_size=1).
+    # Since each Decode sequence contributes exactly 1 token, this equals num_decode_tokens.
+    # For example, if the batch has 3 decode seqs and 2 prefill seqs:
+    #   seqs (after reorder): [D0, D1, D2, P0, P1]
+    #   num_decode_seqs = 3
+    num_decode_seqs: int = 0
+    # Number of Decode tokens in the merged input (same as num_decode_seqs).
+    # This marks the index in the merged q/k/v tensors where Prefill tokens begin.
+    # For example, if q has shape (307, ...):
+    #   q[:3]   -> Decode tokens (D0, D1, D2, each q_len=1)
+    #   q[3:307] -> Prefill tokens (P0 has q_len=50, P1 has q_len=254)
+    num_decode_tokens: int = 0
     
 _CONTEXT = Context()
 
@@ -74,6 +93,8 @@ def set_context(
     slot_mapping=None,
     block_tables=None,
     context_lens=None,
+    num_decode_seqs: int = 0,
+    num_decode_tokens: int = 0,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -85,4 +106,6 @@ def set_context(
         slot_mapping,
         block_tables,
         context_lens,
+        num_decode_seqs,
+        num_decode_tokens,
     )

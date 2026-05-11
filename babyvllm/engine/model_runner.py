@@ -41,9 +41,12 @@ class ModelRunner:
         dist.init_process_group(backend='nccl', init_method='tcp://localhost:12345', world_size=config.tensor_parallel_size, rank=rank)
         torch.cuda.set_device(rank)
         torch.set_default_device(f'cuda:{rank}')
-        
+
         self.default_dtype = config.hf_config.dtype
         torch.set_default_dtype(self.default_dtype)
+
+        # Set by prepare_forward() and consumed by run() to avoid re-computing is_decode_only.
+        self._is_decode_only = False
         
         # Create model and sampler.
         self.model = Qwen3ForCausalLM(config.hf_config).cuda(rank)
@@ -283,6 +286,12 @@ class ModelRunner:
                 slot_mapping=slot_mapping[:batch_size],
                 block_tables=block_tables[:batch_size],
                 context_lens=context_lens[:batch_size],
+                num_decode_seqs=batch_size,
+                num_decode_tokens=batch_size,
+                prefill_max_seqlen_q=0,
+                prefill_max_seqlen_k=0,
+                cu_seqlens_q_offset=0,
+                cu_seqlens_k_offset=0,
             )
             # Warm up.
             # Complete memory allocation before capturing CUDA graph,
@@ -440,8 +449,9 @@ class ModelRunner:
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         
         # Only when all sequences are in the decode phase, this batch can be counted as `is_decode_only`.
-        # (used to trigger CUDA Graph)
-        is_decode_only = all(seq.num_computed_tokens > 0 and seq.num_computed_tokens == seq.num_tokens-1 for seq in seqs)
+        # Pure decode batches can use CUDA Graph replay (10x faster than eager execution).
+        # Save on the instance so run() can reuse it without a second O(N) scan.
+        self._is_decode_only = all(seq.num_computed_tokens > 0 and seq.num_computed_tokens == seq.num_tokens-1 for seq in seqs)
 
         # Calculate split point for mixed batch reordering.
         # After sorting, Decode sequences are first, Prefill sequences are after.
@@ -455,8 +465,21 @@ class ModelRunner:
         num_decode_seqs = sum(1 for s in seqs if s.num_computed_tokens > 0 and s.num_computed_tokens == s.num_tokens - 1)
         num_decode_tokens = num_decode_seqs
 
+        # Pre-compute Prefill sub-batch scalars on the CPU side to avoid
+        # GPU-CPU sync (.item()) in Attention.forward().
+        if num_decode_seqs < len(seqs):
+            prefill_max_seqlen_q = max(seqlens_q[num_decode_seqs:])
+            prefill_max_seqlen_k = max(seqlens_k[num_decode_seqs:])
+            cu_seqlens_q_offset = cu_seqlens_q[num_decode_seqs]
+            cu_seqlens_k_offset = cu_seqlens_k[num_decode_seqs]
+        else:
+            prefill_max_seqlen_q = 0
+            prefill_max_seqlen_k = 0
+            cu_seqlens_q_offset = 0
+            cu_seqlens_k_offset = 0
+
         set_context(
-            is_prefill=not is_decode_only,
+            is_prefill=not self._is_decode_only,
             cu_seqlens_q=torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             cu_seqlens_k=torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             max_seqlen_q=max(seqlens_q, default=0),
@@ -466,12 +489,11 @@ class ModelRunner:
             context_lens=torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             num_decode_seqs=num_decode_seqs,
             num_decode_tokens=num_decode_tokens,
+            prefill_max_seqlen_q=prefill_max_seqlen_q,
+            prefill_max_seqlen_k=prefill_max_seqlen_k,
+            cu_seqlens_q_offset=cu_seqlens_q_offset,
+            cu_seqlens_k_offset=cu_seqlens_k_offset,
         )
-        
-        for i, s in enumerate(seqs):
-            is_dec = s.num_computed_tokens > 0 and s.num_computed_tokens == s.num_tokens - 1
-            print(f"  seq[{i}]: decode={is_dec}, chunk={s.chunk_size}")
-            print(f"  num_decode_seqs={num_decode_seqs}, num_decode_tokens={num_decode_tokens}")
         
         return input_ids, positions
     
@@ -486,20 +508,21 @@ class ModelRunner:
             is_decode_only: Whether there is only decode requests in the batch.
         """
         
-        # Mixed batch has highly dynamic variabale tensor shape,
+        # Mixed batch has highly dynamic variable tensor shape,
         # but CUDA graph can not capture variable tensor shape.
         # So, only when the batch is in pure decode phase and eager mode is not used, we can use CUDA graph.
         if not is_decode_only or self.enforce_eager:
-            logits = self.model.compute_logits(self.model(input_ids, positions))
+            hidden_states = self.model(input_ids, positions)
+            logits = self.model.compute_logits(hidden_states)
         else:
             bs = input_ids.size(0)
             context = get_context()
-            
+
             # Find the CUDA graph that can handle current batch size while minimize memory waste.
-            # `next(bs_ for bs_ in self.graphs.keys() if bs_ >= bs)` 
+            # `next(bs_ for bs_ in self.graphs.keys() if bs_ >= bs)`
             # finds the smallest batch size that is >= to current batch size.
             graph = self.graphs[next(bs_ for bs_ in self.graph_batch_sizes if bs_ >= bs)]
-            
+
             # Copy input data into graph variables.
             # Do not change memory layout which has been captured. Use in-place operations.
             graph_vars = self.graph_vars
@@ -510,49 +533,45 @@ class ModelRunner:
             graph_vars['context_lens'].zero_()
             graph_vars['context_lens'][:bs] = context.context_lens
             graph_vars['block_tables'][:bs, :context.block_tables.size(1)] = context.block_tables
-            
+
             # Replay CUDA graph.
             graph.replay()
             logits = self.model.compute_logits(graph_vars['outputs'][:bs])
-        
+
         return logits
     
     @torch.inference_mode()
     def run(self, seqs: list[Sequence]) -> list[int]:
         """ Run model inference for a batch of sequences and return output token ids. """
 
+        # Prepare sampling temperatures in original order before prepare_forward
+        # reorders sequences. They will be reordered below to match sorted logits.
+        temperatures_original = self.prepare_sample(seqs) if self.rank == 0 else None
+
         # Prepare the data for forward pass (prefill or decode).
         # prepare_forward() sorts seqs internally (Decode first, Prefill after)
         # and records the permutation in self._sort_permutation.
         input_ids, positions = self.prepare_forward(seqs)
-        # Prepare sampling temperatures.
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
 
-        # Check if the batch is in pure decode phase.
-        is_decode_only = all(seq.num_computed_tokens > 0 and seq.num_computed_tokens == seq.num_tokens-1 for seq in seqs)
+        # Reorder temperatures to match the sorted logits order.
+        if self.rank == 0:
+            temperatures = temperatures_original[self._sort_permutation]
+        else:
+            temperatures = None
 
         # Execute model inference.
-        logits = self.run_model(input_ids, positions, is_decode_only)
+        # is_decode_only was already computed in prepare_forward() and saved on the instance.
+        logits = self.run_model(input_ids, positions, self._is_decode_only)
 
         # Sample tokens from logits.
         # Convert token ids to list of int, since sequence only supports int token ids.
         if self.rank == 0:
+            # token_ids_sorted has len(seqs) entries — one sampled token per sequence
+            # in sorted order (Decode first, Prefill after).
             token_ids_sorted = self.sampler(logits, temperatures).tolist()
-            # Unsort `token_ids` back to original sequence order.
-            # `token_ids_sorted` is in order of sorted sequences,
-            # and we need to restore it to original sequence order.
-            # Then, we can use scheduler.postprocess() to align token_ids with sequences.
-            
-            # For exmaple:
-            # If `prepare_forward` sorts [A, B, C, D, E] to [A, B, D, C, E],
-            # then `token_ids_sorted` is [tok_A, tok_B, tok_D, tok_C, tok_E],
-            # and `self._sort_permutation` is [0, 1, 3, 2, 4].
-            # The recovery process is as follows:
-            #     unsorted[perm[i]] = token_ids_sorted[i]
-            # The result is as follows:
-            # unsorted[0] = tok_A, unsorted[1] = tok_B, unsorted[3] = tok_D, unsorted[2] = tok_C, unsorted[4] = tok_E
-            #   -> [tok_A, tok_B, tok_C, tok_D, tok_E]
-            token_ids = [0]*len(token_ids_sorted)
+            # Unsort back to original sequence order.
+            # _sort_permutation[i] = original_index of the i-th sorted sequence.
+            token_ids = [0] * len(seqs)
             for sorted_pos, original_pos in enumerate(self._sort_permutation):
                 token_ids[original_pos] = token_ids_sorted[sorted_pos]
         else:

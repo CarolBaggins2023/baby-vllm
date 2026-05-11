@@ -11,7 +11,7 @@ class Scheduler:
         (1) Manage kv cache blocks. Create the BlockManager object.
         (2) Track sequence status. Create the waiting queue and running queue.
         (3) Limitations. Limit the number of sequences and tokens.
-        
+
         Args:
             max_num_sequences: The maximum number of sequences that can be scheduled in a single run.
             max_num_batched_tokens: The maximum number of tokens that can be scheduled in a single run.
@@ -19,16 +19,23 @@ class Scheduler:
             block_size: The size of each block.
             eos: The end-of-sequence token id.
         """
-        
+
         # block manager
         self.block_manager = BlockManager(num_blocks=config.num_kvcache_blocks, block_size=config.kvcache_block_size)
         self.max_num_sequences = config.max_num_sequences
         self.max_num_batched_tokens = config.max_num_batched_tokens
-        
+
         # sequence queue
         self.waiting = deque()
         self.running = deque()
         self.eos = config.hf_config.eos_token_id if config.hf_config.eos_token_id is not None else config.eos
+
+        # CUDA Graph optimization tracking.
+        # When the batch is pure decode, we skip adding new prefill sequences
+        # to keep the batch CUDA Graph-friendly. This counter prevents prefill
+        # starvation by forcing mixed batching every N pure-decode rounds.
+        self._prefill_defer_count = 0
+        self._max_prefill_defer = 3
         
     def is_finished(self):
         """ Check if all sequences have finished. """
@@ -152,7 +159,35 @@ class Scheduler:
             self.running.extendleft(reversed(scheduled_sequences))
 
         # ======================
-        # (2) Next, try schedule prefilling sequences from waiting queue using remaining token budget.
+        # (2) CUDA Graph Optimization. Prefer pure Decode sequences batch first.
+        # ======================
+        # Pure Decode sequences batch can trigger CUDA Graph replay,
+        # which is faster than Eager mode.
+        # So, keep the batch pure to trigger the CUDA Graph.
+        #
+        # To prevent Prefill starvation, every _max_prefill_defer rounds pure Decode sequences batch,
+        # force to schedule a mixed batch.
+        if scheduled_sequences and self.waiting:
+            all_decode = all(
+                s.num_computed_tokens > 0 and s.num_computed_tokens == s.num_tokens - 1
+                for s in scheduled_sequences
+            )
+            if all_decode:
+                self._prefill_defer_count += 1
+                if self._prefill_defer_count >= self._max_prefill_defer:
+                    # Schedule a mixed Prefill batch.
+                    self._prefill_defer_count = 0
+                else:
+                    # Keep pure Decode batch → CUDA Graph trigger.
+                    return scheduled_sequences
+            else:
+                self._prefill_defer_count = 0
+        elif scheduled_sequences:
+            # Prefill sequences will be scheduled, so reset the defer count.
+            self._prefill_defer_count = 0
+
+        # ======================
+        # (3) Next, try schedule prefilling sequences from waiting queue using remaining token budget.
         # ======================
         remaining_seq_budget = self.max_num_sequences-len(scheduled_sequences)
         scheduled_new_prefills = []

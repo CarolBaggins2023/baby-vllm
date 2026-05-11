@@ -129,10 +129,9 @@ class Sequence:
     def __setstate__(self, state):
         # Strictly unpack in the order of `__getstate__`.
         (self.num_tokens,
-         self.num_prompt_tokens, 
-         self.num_cached_tokens, 
+         self.num_prompt_tokens,
+         self.num_cached_tokens,
          self.num_computed_tokens,
-         self.chunk_size,
          self.chunk_size,
          self.block_table) = state[:-1]
         

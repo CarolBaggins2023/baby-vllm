@@ -22,6 +22,11 @@ class Context:
     # `max_seqlen_q` is the maximum sequence length, considering both cached and uncached tokens.
     # For example, in the above example, the longest sequence is Sequence 2, with length 5,
     # so `max_seqlen_q` is 5.
+    #
+    # NOTE: This field is no longer used by Attention.forward().
+    # The Prefill branch now recomputes its own max_seqlen_q from the sliced cu_seqlens_q
+    # sub-array, and the Decode branch uses flash_attn_with_kvcache which does not require
+    # max_seqlen_q. Kept for forward_old() compatibility.
     max_seqlen_q: int = 0
     # `cu_seqlens_k` is the cumulative sequence lengths, considering only uncached tokens.
     # It has the same data structure as `cu_seqlens_q`.
@@ -29,6 +34,10 @@ class Context:
     # then `cu_seqlens_k` will be [0, 2, 4, 7].
     cu_seqlens_k: torch.Tensor|None = None
     # `max_seqlen_k` is the maximum sequence length, considering only uncached tokens.
+    #
+    # NOTE: Same situation as max_seqlen_q — no longer used by the active forward().
+    # The Prefill branch recomputes its own max_seqlen_k from the sliced cu_seqlens_k.
+    # Kept for forward_old() compatibility.
     max_seqlen_k: int = 0
 
     # `slot_mapping` maps token index to slot index in cache block. sequence <-> cache block
@@ -74,6 +83,20 @@ class Context:
     #   q[:3]   -> Decode tokens (D0, D1, D2, each q_len=1)
     #   q[3:307] -> Prefill tokens (P0 has q_len=50, P1 has q_len=254)
     num_decode_tokens: int = 0
+
+    # ============================================================
+    # Pre-computed scalar values for the Prefill sub-batch.
+    # These are computed on the CPU side in prepare_forward() and
+    # consumed by Attention.forward() to avoid GPU-CPU sync (.item()).
+    # ============================================================
+    # max_seqlen_q for the Prefill sub-sequences only
+    prefill_max_seqlen_q: int = 0
+    # max_seqlen_k for the Prefill sub-sequences only
+    prefill_max_seqlen_k: int = 0
+    # Starting offset for the Prefill portion in cu_seqlens_q (= cu_seqlens_q[num_decode_seqs])
+    cu_seqlens_q_offset: int = 0
+    # Starting offset for the Prefill portion in cu_seqlens_k (= cu_seqlens_k[num_decode_seqs])
+    cu_seqlens_k_offset: int = 0
     
 _CONTEXT = Context()
 
@@ -95,6 +118,10 @@ def set_context(
     context_lens=None,
     num_decode_seqs: int = 0,
     num_decode_tokens: int = 0,
+    prefill_max_seqlen_q: int = 0,
+    prefill_max_seqlen_k: int = 0,
+    cu_seqlens_q_offset: int = 0,
+    cu_seqlens_k_offset: int = 0,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -108,4 +135,9 @@ def set_context(
         context_lens,
         num_decode_seqs,
         num_decode_tokens,
+        prefill_max_seqlen_q,
+        prefill_max_seqlen_k,
+        cu_seqlens_q_offset,
+        cu_seqlens_k_offset,
     )
+    

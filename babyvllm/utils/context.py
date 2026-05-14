@@ -1,4 +1,5 @@
 import torch
+import contextvars
 from dataclasses import dataclass
 
 @dataclass
@@ -56,27 +57,98 @@ class Context:
     # After first deocoding and before second decoding, `context_lens` becomes [6, 4].
     context_lens: torch.Tensor|None = None
     
-_CONTEXT = Context()
+# ---------------------------------------------------------------------------
+#  To implement online service:
+#    Replace module-level global mutable singleton with contextvars.ContextVar.
+#
+#  Problem Background (before refactoring):
+#    The old code used a module-level global variable `_CONTEXT = Context()` to store attention metadata.
+#    Each call to set_context() directly overwrites this global object.
+#    When multiple requests execute concurrently, different model forward passes overwrite each other's attention metadata.
+#    It leads to:
+#      - cu_seqlens / block_tables / slot_mapping corruption
+#      - KV cache written to wrong locations, producing random outputs or even CUDA illegal memory access
+#
+#  Solution:
+#    Python 3.7+'s built-in contextvars module provides "context variables" (ContextVar),
+#    where each asyncio Task has its own independent copy of the variable.
+#
+#  How it works:
+#      ┌──────────────────────────────────────────────────────┐
+#      │  Task A                    Task B                    │
+#      │  set_context(seqs=[1,2])   set_context(seqs=[3])    │
+#      │       ↓                         ↓                   │
+#      │  _context_var:             _context_var:            │
+#      │    {seqs: [1,2]}             {seqs: [3]}            │
+#      │       ↓                         ↓                   │
+#      │  get_context() → [1,2]     get_context() → [3]      │
+#      └──────────────────────────────────────────────────────┘
+#    Values written via set() by each Task are only visible to itself and child Tasks derived from it.
+#    Tasks are completely isolated and do not interfere with each other.
+#
+#  Why not threading.local:
+#    threading.local isolates by thread, but multiple asyncio coroutines may share the same thread.
+#    In this case, threading.local cannot distinguish between different Tasks,
+#    leading to the same conflicts as global variables.
+#
+#  Why not multiprocessing.Manager:
+#    The model needs to read context at each inference step.
+#    Manager's IPC latency (~microsecond level) would seriously slow down inference throughput.
+#    ContextVar is a pure C-implemented thread/coroutine local storage with negligible overhead.
+# ---------------------------------------------------------------------------
+# ContextVar itself is a module-level shared "key", but each Task uses this key to open its own "locker".
+# default=Context() ensures that in environments where set() has not been called explicitly
+# (e.g., single-threaded offline inference), get() returns a clean default Context, behaving exactly as before refactoring.
+_context_var: contextvars.ContextVar[Context] = contextvars.ContextVar(
+    'context',
+    default=Context(),
+)
 
 def get_context() -> Context:
-    return _CONTEXT
+    """
+    Get the Context object for the current context.
+
+    Equivalent to reading the current Task's private attention metadata.
+    In single-threaded offline inference, since set() is never called,
+    each get() returns default=Context(), behaving exactly as
+    the global singleton before refactoring.
+
+    Call chain example (decode phase):
+      model_runner.prepare_decode()             -- set_context(... current batch)
+      model_runner.run_model()                  -- graph.replay()
+        └─ attention.py:forward()               -- get_context().block_tables
+           embedding_head.py:forward()           -- get_context().context_lens
+      model_runner.run()                        -- reset_context()
+    """
+    return _context_var.get()
 
 def reset_context():
-    global _CONTEXT
-    _CONTEXT = Context()
+    """
+    Reset the current context to a brand new empty Context.
+
+    Typically called after model forward pass completes to ensure the context is
+    clean before the next step() begins, preventing residual data from the previous
+    set_context() (e.g., slot_mapping) from being incorrectly reused.
+    """
+    _context_var.set(Context())
 
 def set_context(
-    is_prefill,
-    cu_seqlens_q = None,
-    max_seqlen_q = 0,
-    cu_seqlens_k = None,
-    max_seqlen_k = 0,
-    slot_mapping=None,
-    block_tables=None,
-    context_lens=None,
+    is_prefill: bool,
+    cu_seqlens_q: torch.Tensor | None = None,
+    max_seqlen_q: int = 0,
+    cu_seqlens_k: torch.Tensor | None = None,
+    max_seqlen_k: int = 0,
+    slot_mapping: torch.Tensor | None = None,
+    block_tables: torch.Tensor | None = None,
+    context_lens: torch.Tensor | None = None,
 ):
-    global _CONTEXT
-    _CONTEXT = Context(
+    """
+    Set all attention metadata required for the current context.
+
+    ContextVar.set() only affects the current Task (and child Tasks derived from it),
+    and does not pollute contexts of other concurrent requests.
+    """
+    _context_var.set(Context(
         is_prefill,
         cu_seqlens_q,
         max_seqlen_q,
@@ -85,4 +157,4 @@ def set_context(
         slot_mapping,
         block_tables,
         context_lens,
-    )
+    ))

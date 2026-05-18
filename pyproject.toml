@@ -9,7 +9,13 @@ dependencies = [
     "torch",
     "xxhash",
     "flash-attn",
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic",
 ]
+
+[project.scripts]
+babyvllm-server = "babyvllm.entrypoints.cli:main"
 
 [project.optional-dependencies]
 dev = [

@@ -19,7 +19,10 @@ class Config:
     hf_config: AutoConfig | None = None
     
     def __post_init__(self):
-        assert os.path.isdir(self.model)
+        assert os.path.isdir(self.model), (
+            f"Model path '{self.model}' does not exist or is not a directory. "
+            f"Please check that the path is correct and the model files are present."
+        )
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)

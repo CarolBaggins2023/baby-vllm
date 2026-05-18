@@ -113,4 +113,70 @@ class Scheduler:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
+
+    def abort_sequence(self, seq_id: int) -> bool:
+        """
+        Abort a sequence by seq_id.
+
+        Finds the sequence in waiting or running deque, marks it FINISHED,
+        deallocates KV cache blocks, and removes from queue.
+
+        Why this exists:
+          When a client disconnects or a request is cancelled, the corresponding
+          Sequence must be removed from the scheduler's internal state immediately.
+          If not removed, the scheduler would continue allocating compute and memory
+          to a sequence whose output nobody consumes, wasting resources.
+          This method provides O(n) linear scan — n is bounded by max_num_sequences
+          (typically <= 256), so the cost is negligible.
+
+        Edge Cases Handled:
+          - Sequence in waiting queue (prefill not yet started): blocks may not
+            have been allocated yet. block_manager.deallocate() is a safe no-op
+            for sequences with no allocated blocks.
+          - Sequence in running queue: blocks are always allocated, so deallocate
+            frees them back to the free block list.
+          - Sequence not found (already completed or never existed): returns False
+            silently. Caller can use this to detect double-abort scenarios.
+
+        Args:
+            seq_id: The sequence ID to abort.
+
+        Returns:
+            True if the sequence was found and aborted, False if not found.
+
+        Example:
+            scheduler.abort_sequence(seq_id=5)
+            # → Sequence 5 removed from waiting/running, blocks freed
+            # → Returns True if seq_id=5 existed, False otherwise
+
+        Called by:
+            - AsyncLLMEngine.abort() when client disconnects
+            - AsyncLLMEngine._engine_step() when processing aborted requests
+              or cleaning up after catastrophic engine failure
+        """
+        # Search waiting deque (linear scan O(n), n is small - typically ≤256)
+        for i, seq in enumerate(self.waiting):
+            if seq.seq_id == seq_id:
+                seq.status = SequenceStatus.FINISHED
+                # Safe no-op if blocks not yet allocated:
+                #   When sequence is in waiting queue, it hasn't been scheduled
+                #   for prefill yet, so no KV cache blocks have been allocated.
+                #   block_manager.deallocate() checks internal dict and silently
+                #   returns if no blocks found.
+                self.block_manager.deallocate(seq)
+                del self.waiting[i]
+                return True
+
+        # Search running deque
+        for i, seq in enumerate(self.running):
+            if seq.seq_id == seq_id:
+                seq.status = SequenceStatus.FINISHED
+                self.block_manager.deallocate(seq)
+                del self.running[i]
+                return True
+
+        # Not found: sequence may have already completed normally
+        # (postprocess removes finished seqs from running deque),
+        # or was already aborted in a previous call.
+        return False
     

@@ -48,8 +48,12 @@ class RequestOutput:
 
     Attributes:
         request_id:
-            Unique identifier for the request, corresponding to Sequence.seq_id.
+            Unique identifier for the request, from AsyncLLMEngine._request_counter.
             Used by RequestTracker to route output to the correct AsyncStream.
+            NOT the same as Sequence.seq_id — the engine maintains its own ID
+            space (via itertools.count) independent of the scheduler's sequence
+            IDs (from Sequence.counter). The mapping between the two is maintained
+            in AsyncLLMEngine._seq_to_request and _request_to_seq.
             
         text:
             Text corresponding to tokens generated in this step (detokenized).

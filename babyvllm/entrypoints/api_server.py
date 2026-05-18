@@ -1322,12 +1322,24 @@ async def _non_stream_completion(
         HTTPException(500): If no output was generated (engine returned empty).
     """
     final_output: Optional[RequestOutput] = None
+    engine_request_id: Optional[int] = None  # Capture engine's internal int ID for abort
 
     # Consume all outputs from the async generator.
     # In current engine, only 1 output per request (when finished).
     # The for-loop pattern future-proofs for incremental decoding.
-    async for output in _engine.generate(prompt, sampling_params):
-        final_output = output
+    try:
+        async for output in _engine.generate(prompt, sampling_params):
+            if engine_request_id is None:
+                engine_request_id = output.request_id
+            final_output = output
+    except asyncio.CancelledError:
+        # Client disconnected — ensure engine-side cleanup.
+        # Although AsyncStream.aclose() also triggers abort via the cancel hook,
+        # explicitly calling abort() provides defense-in-depth and cleans up
+        # AsyncLLMEngine internal mappings (_request_to_seq, _seq_to_request, _prompt_map).
+        if engine_request_id is not None:
+            _engine.abort(engine_request_id)
+        raise  # Re-raise so FastAPI knows the request was cancelled
 
     if final_output is None:
         raise HTTPException(status_code=500, detail="No output generated")
@@ -1395,9 +1407,20 @@ async def _non_stream_chat_completion(
         HTTPException(500): If no output was generated.
     """
     final_output: Optional[RequestOutput] = None
+    engine_request_id: Optional[int] = None  # Capture engine's internal int ID for abort
 
-    async for output in _engine.generate(prompt_token_ids, sampling_params):
-        final_output = output
+    try:
+        async for output in _engine.generate(prompt_token_ids, sampling_params):
+            if engine_request_id is None:
+                engine_request_id = output.request_id
+            final_output = output
+    except asyncio.CancelledError:
+        # Client disconnected — ensure engine-side cleanup.
+        # Although AsyncStream.aclose() also triggers abort via the cancel hook,
+        # explicitly calling abort() provides defense-in-depth.
+        if engine_request_id is not None:
+            _engine.abort(engine_request_id)
+        raise  # Re-raise so FastAPI knows the request was cancelled
 
     if final_output is None:
         raise HTTPException(status_code=500, detail="No output generated")
@@ -1477,8 +1500,16 @@ async def _stream_completion(
         str: SSE-formatted data lines.
     """
     created = int(time.time())
+    engine_request_id: Optional[int] = None  # Capture engine's internal int ID for abort
     try:
         async for output in _engine.generate(prompt, sampling_params):
+            # Capture engine request_id on first output for abort() calls.
+            # output.request_id is the engine's internal integer ID (from
+            # _request_counter), NOT the API-layer string request_id (from _random_id).
+            # We need this to call _engine.abort() in the CancelledError handler.
+            if engine_request_id is None:
+                engine_request_id = output.request_id
+
             text = output.text
 
             # Echo: prepend prompt text on first chunk only
@@ -1512,9 +1543,18 @@ async def _stream_completion(
         yield "data: [DONE]\n\n"
 
     except asyncio.CancelledError:
-        # Client disconnected — clean exit, no error to report
-        # The AsyncStream.aclose() has already called abort_request()
-        # to clean up engine-side resources.
+        # Client disconnected — ensure engine-side cleanup.
+        # Although AsyncStream.aclose() also triggers abort via the cancel hook,
+        # explicitly calling abort() here provides defense-in-depth:
+        #   - Guarantees cleanup even if aclose() is not called (edge case)
+        #   - Makes the cleanup path visible in the code
+        #   - Cleans up AsyncLLMEngine internal mappings that the
+        #     tracker alone cannot touch (_request_to_seq, _seq_to_request, _prompt_map)
+        if engine_request_id is not None:
+            _engine.abort(engine_request_id)
+        # Do NOT re-raise. Starlette's StreamingResponse internally catches
+        # CancelledError when client disconnects. Re-raising would cause
+        # unexpected behavior in the HTTP layer.
         pass
 
 
@@ -1556,8 +1596,15 @@ async def _stream_chat_completion(
     """
     created = int(time.time())
     is_first: bool = True  # Track whether this is the first chunk for role inclusion
+    engine_request_id: Optional[int] = None  # Capture engine's internal int ID for abort
     try:
         async for output in _engine.generate(prompt_token_ids, sampling_params):
+            # Capture engine request_id on first output for abort() calls.
+            # output.request_id is the engine's internal integer ID (from
+            # _request_counter), NOT the API-layer string request_id.
+            if engine_request_id is None:
+                engine_request_id = output.request_id
+
             delta = DeltaMessage()
 
             # First chunk: include role="assistant"
@@ -1605,5 +1652,12 @@ async def _stream_chat_completion(
         yield "data: [DONE]\n\n"
 
     except asyncio.CancelledError:
-        # Client disconnected — clean exit
+        # Client disconnected — ensure engine-side cleanup (defense-in-depth).
+        # Although AsyncStream.aclose() also triggers abort via the cancel hook,
+        # explicitly calling abort() here provides defense-in-depth:
+        #   - Guarantees cleanup even if aclose() is not called (edge case)
+        #   - Makes the cleanup path visible in the code
+        #   - Cleans up AsyncLLMEngine internal mappings
+        if engine_request_id is not None:
+            _engine.abort(engine_request_id)
         pass

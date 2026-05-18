@@ -178,6 +178,13 @@ class AsyncLLMEngine:
         #   All reverse lookup scenarios occur during output routing where seq_id is known.
         self._seq_to_request: dict[int, int] = {}
 
+        # Reverse mapping: request_id → seq_id.
+        # Written in _add_request_to_engine() when Sequence is created,
+        # Read and popped in abort() and _engine_step() when processing aborted requests.
+        # Why needed? abort() is called with request_id (from API layer),
+        # but scheduler.abort_sequence() requires seq_id.
+        self._request_to_seq: dict[int, int] = {}
+
         # request_id → prompt_token_ids mapping.
         # Written in add_request() (called by API layer),
         # Read and popped during output routing phase in _engine_step().
@@ -376,6 +383,12 @@ class AsyncLLMEngine:
         # constructing RequestOutput and routing to correct AsyncStream.
         self._seq_to_request[seq.seq_id] = request_id
 
+        # Build reverse mapping for abort() lookups.
+        # abort() is called with request_id (from API layer / CancelledError handler),
+        # but scheduler.abort_sequence() requires seq_id.
+        # This reverse mapping enables O(1) lookup instead of scanning _seq_to_request.
+        self._request_to_seq[request_id] = seq.seq_id
+
     # =========================================================================
     # Phase 3: Single Engine Iteration
     # =========================================================================
@@ -384,15 +397,28 @@ class AsyncLLMEngine:
         """
         Execute one complete inference step of the engine.
 
-        This is the core of the background loop - each iteration covers the complete chain:
-        "new request admission -> scheduling -> GPU execution -> result routing".
+        Full cycle: abort processing → new request admission → scheduling →
+        GPU execution → result routing. Updated for Phase 5 with error handling
+        and abort support.
 
         Execution Order:
-          1. Drain new request queue from RequestTracker (_new_requests → scheduler)
-          2. Check if there is work to do (new requests or active sequences in scheduler)
-          3. Return False if no work
-          4. Execute engine.step() in thread pool if there is work
-          5. Process completed sequences returned by step(), construct RequestOutput and route to corresponding stream
+          1. Drain aborted requests + new requests from RequestTracker
+          2. Process aborts first (free KV cache blocks before scheduling)
+          3. Land new requests to scheduler (with per-request error handling)
+          4. Check if there is work to do
+          5. Execute engine.step() in thread pool (with catastrophic error handling)
+          6. Route outputs to corresponding streams
+
+        Error Handling Strategy (Two-Level):
+          Level 1 - Per-request errors: If adding a single request fails,
+                    propagate exception to that request's stream only.
+                    Other requests continue unaffected.
+          Level 2 - Catastrophic errors: If engine.step() itself fails,
+                    all active requests get the exception.
+                    All scheduler state is cleaned up.
+
+        Returns:
+            True if engine.step() was executed, False if idle.
 
         About engine.step() return value:
           Current LLMEngine.step() only returns completed sequences (filtered by seq.is_finished).
@@ -402,112 +428,142 @@ class AsyncLLMEngine:
             - Final step: outputs contains (seq_id, completion_token_ids) (EOS/reached max_tokens)
           Therefore, each request typically has only one RequestOutput (finished=True),
           returning all generated text at once when request completes.
-
-        Returns:
-            True:  engine.step() executed this round (work available)
-            False: idle this round (empty scheduler and no new requests)
-
-        Concurrency Safety:
-            This method calls engine.step() in thread pool, but engine.step() internally
-            accesses no AsyncLLMEngine state (only scheduler, model_runner, tokenizer).
-            Therefore, all AsyncLLMEngine state access (_seq_to_request, _prompt_map, etc.)
-            is naturally single-threaded.
         """
 
-        # (1) Drain new request queue
-        # get_new_requests() drains tracker._new_requests queue:
-        #   - For each (stream, request_data), register stream in _request_streams
-        #   - Return request_data list
-        # This is the only place engine loop reads _new_requests, ensuring FIFO order.
-        new_requests = self._request_tracker.get_new_requests()
+        # =====================================================================
+        # (1) Drain aborted requests AND new requests from tracker
+        # =====================================================================
+        # get_new_and_aborted_requests() processes both queues atomically:
+        #   - Aborted IDs are deduplicated into a set
+        #   - New requests that happen to also be in the abort set are rejected
+        #     immediately (extreme race: add + immediate cancel)
+        #   - Surviving new requests are registered in _request_streams
+        new_requests, aborted_request_ids = \
+            self._request_tracker.get_new_and_aborted_requests()
 
-        # "Land" each new request to engine scheduler.
+        # =====================================================================
+        # (2) Process aborted requests FIRST
+        # =====================================================================
+        # Why before new request landing?
+        #   Aborting frees KV cache blocks. Processing aborts first maximizes
+        #   available blocks for new requests in the same iteration.
+        #   This improves scheduling efficiency under churn.
+        for request_id in aborted_request_ids:
+            # Look up seq_id from reverse mapping
+            seq_id = self._request_to_seq.pop(request_id, None)
+            if seq_id is not None:
+                # Abort in scheduler (free blocks, remove from deques)
+                self.engine.scheduler.abort_sequence(seq_id)
+                # Clean forward mapping
+                self._seq_to_request.pop(seq_id, None)
+            # Clean prompt map
+            self._prompt_map.pop(request_id, None)
+
+        # =====================================================================
+        # (3) Land new requests to scheduler
+        # =====================================================================
         for request_data in new_requests:
-            self._add_request_to_engine(request_data)
+            try:
+                self._add_request_to_engine(request_data)
+            except Exception as e:
+                # Level 1: Per-request error.
+                # If landing one request fails (e.g., invalid data), propagate
+                # the exception to just that request's stream. Other requests
+                # continue normally.
+                self._request_tracker.process_exception(
+                    request_data["request_id"], e
+                )
 
-        # (2) Check if there is work
-        # "Has work" defined as any of:
-        #   a) New requests arrived this round (already added to scheduler waiting queue above)
-        #   b) Still waiting or running sequences in scheduler
+        # =====================================================================
+        # (4) Check if there is work to do
+        # =====================================================================
+        # "Has work" = new requests landed this round OR scheduler has active sequences.
         #
-        # Scheduler.is_finished() returns True if and only if:
-        #   Both self.waiting and self.running deques are empty
-        #
-        # Note: Even if scheduler.is_finished() is True,
-        # if new_requests arrived this round (non-empty), they were added to waiting queue above,
-        # so is_finished() returns False. Explicit bool(new_requests) check makes it clearer.
+        # Note on ordering: We check AFTER processing aborts because abort may
+        # have emptied the scheduler. But if new_requests landed successfully,
+        # they're now in the scheduler's waiting queue, so is_finished() returns False.
         has_work = bool(new_requests) or not self.engine.scheduler.is_finished()
 
-        # (3) Early return if no work
         if not has_work:
             return False
 
-        # (4) Execute engine.step() in thread pool
-        #
-        # Why use run_in_executor?
-        #   model_runner.call() involves GPU operations and inter-process communication (shared memory + Event),
-        #   which is synchronous blocking (may take tens to hundreds of ms).
-        #   Executing in default ThreadPoolExecutor frees the asyncio event loop to handle other coroutines
-        #   (e.g., stream.generator() consumption from other generate(), new request add_request(), etc.).
-        #
-        # Why not use ProcessPoolExecutor?
-        #   engine.step() needs to communicate with worker processes (via shared memory + Event),
-        #   these IPC mechanisms are bound to the main process. Forked child processes cannot use them properly.
-        #
-        # Note: Python GIL is released in PyTorch C extensions (CUDA operations), so thread pool is effective.
+        # =====================================================================
+        # (5) Execute engine.step() with catastrophic error handling
+        # =====================================================================
         loop = asyncio.get_running_loop()
-        # None = use default ThreadPoolExecutor (auto-created in Python 3.8+)
-        outputs, is_prefill = await loop.run_in_executor(
-            None,
-            self.engine.step,
-        )
+        try:
+            outputs, is_prefill = await loop.run_in_executor(
+                None,
+                self.engine.step,
+            )
+        except Exception as e:
+            # Level 2: Catastrophic engine failure.
+            # This means the model runner itself failed (GPU OOM, CUDA error,
+            # multiprocessing failure, etc.). All in-flight requests are affected
+            # because the engine operates on all sequences as a batch.
 
-        # (5) Construct RequestOutput and route
-        # engine.step() only returns outputs for completed (FINISHED) sequences.
-        # For each completed sequence:
-        #   - Reverse lookup request_id via _seq_to_request
-        #   - Get prompt_token_ids from _prompt_map
-        #   - Decode completion_token_ids to full text
-        #   - Construct RequestOutput and add to list
-        #   - Pop from mapping tables (sequence completed, mapping no longer needed)
+            # Propagate exception to ALL active request streams
+            self._request_tracker.process_exception_all(e)
+
+            # Abort all sequences still in scheduler (frees KV cache blocks)
+            # Must iterate over snapshots since abort_sequence mutates the deques.
+            # Example: if running=[seq1, seq2, seq3] and we abort seq1,
+            #          the deque shifts; iterating a snapshot avoids index errors.
+            for seq in list(self.engine.scheduler.running) + \
+                       list(self.engine.scheduler.waiting):
+                self.engine.scheduler.abort_sequence(seq.seq_id)
+
+            # Clean up ALL internal mappings (nothing left to track)
+            self._seq_to_request.clear()
+            self._request_to_seq.clear()
+            self._prompt_map.clear()
+
+            # Re-raise to crash the background loop.
+            # The API layer will see the exception through the streams
+            # (already propagated above). The loop exits, and a new one
+            # will be lazily created on the next generate() call.
+            raise
+
+        # =====================================================================
+        # (6) Route outputs to request streams
+        # =====================================================================
         request_outputs: list[RequestOutput] = []
 
         for seq_id, completion_token_ids in outputs:
-            # Lookup and remove seq_id -> request_id mapping.
-            # Use pop() instead of get():
-            #   - Sequence completed, mapping no longer needed
-            #   - Clean up promptly to prevent memory leak
-            #   - Default None handles edge case (seq_id not in mapping due to exception)
+            # Look up and clean request_id from forward mapping
             request_id = self._seq_to_request.pop(seq_id, None)
 
             if request_id is not None:
-                # Normal path: Found corresponding request_id.
+                # Normal path: found corresponding request_id.
                 # Get and remove prompt_token_ids from _prompt_map.
                 # Why pop instead of get?
                 #   - Request completed, prompt info written to RequestOutput, no longer needed
                 #   - Clean up promptly to release memory (especially important for long prompts)
                 prompt_token_ids = self._prompt_map.pop(request_id, [])
+                # Also clean reverse mapping (request completed normally).
+                # pop() is idempotent-safe: returns None if key missing.
+                self._request_to_seq.pop(request_id, None)
             else:
-                # Abnormal path: seq_id not found in _seq_to_request.
-                # Possible reasons:
-                #   - Stale sequence before engine initialization (theoretically impossible)
-                #   - Mapping lost due to edge cases like concurrent cancellation
-                # Degradation handling: Use empty prompt and placeholder request_id.
-                # This RequestOutput will still be routed by tracker,
-                # but request_id=-1 will almost certainly not be found in _request_streams,
-                # and tracker.process_request_output() will silently drop it (safe degradation).
+                # Abnormal path: seq_id not found in mapping.
+                # This can happen when the sequence was aborted between
+                # schedule() and step() — the abort cleaned the mappings,
+                # but the model runner still produced output for it.
+                #
+                # Example: if request_id=5 with seq_id=3 was aborted between
+                # schedule() and step(), the abort already popped
+                # _seq_to_request[3] -> None. When step() returns output for
+                # seq_id=3, _seq_to_request.pop(3) returns None.
+                #
+                # Degradation: use placeholder values. The output will be
+                # silently dropped by process_request_output() since the
+                # stream was already finished.
                 prompt_token_ids = []
                 request_id = -1
 
-            # Decode: Convert completion_token_ids back to text.
-            # Since engine.step() returns complete completion tokens
-            # (from first generated token to end token), one decode yields full output text.
+            # Decode completion tokens to text
             text = self.tokenizer.decode(completion_token_ids)
 
-            # Construct RequestOutput.
-            # finished is always True because engine.step() only outputs filtered by seq.is_finished.
-            # If engine.step() changes to output incremental tokens (streaming) in the future,
-            # this needs to set finished based on actual completion status.
+            # Build RequestOutput
             request_outputs.append(RequestOutput(
                 request_id=request_id,
                 text=text,
@@ -516,12 +572,7 @@ class AsyncLLMEngine:
                 prompt_token_ids=prompt_token_ids,
             ))
 
-        # Batch routing: Pass all RequestOutputs to tracker at once.
-        # RequestTracker.process_step_outputs() internally:
-        #   - Calls process_request_output() for each RequestOutput
-        #   - process_request_output() puts output into corresponding stream._queue
-        #   - If output.finished=True -> stream.finish() -> put STOP_ITERATION
-        #     -> Also pop from _request_streams for cleanup
+        # Batch route all outputs to corresponding streams
         self._request_tracker.process_step_outputs(request_outputs)
 
         return True
@@ -735,6 +786,73 @@ class AsyncLLMEngine:
         # for future incremental output support (yield per token).
         async for output in stream.generator():
             yield output
+
+    # =========================================================================
+    # Phase 6: Request Cancellation
+    # =========================================================================
+
+    def abort(self, request_id: int) -> None:
+        """
+        Abort a request by its internal engine request_id.
+
+        Performs full cleanup across all layers:
+          1. RequestTracker: finish the stream with CancelledError
+          2. Scheduler: abort the underlying sequence, free KV cache blocks
+          3. Internal mappings: clean up _seq_to_request, _request_to_seq, _prompt_map
+
+        Idempotent: safe to call multiple times for the same request_id.
+        All dict pop() operations return None on missing keys, which are silently ignored.
+
+        Why this exists:
+          When a client disconnects during streaming (CancelledError in API layer),
+          the engine must release GPU resources (KV cache blocks) and clean up
+          internal state. Without explicit cleanup, aborted sequences continue to
+          consume KV cache blocks indefinitely, starving new requests.
+
+        Called by:
+          - api_server.py when client disconnects (CancelledError handler)
+          - _engine_step() when processing aborted requests from tracker
+
+        Args:
+            request_id: Internal engine request ID (integer, generated by
+                        _request_counter in add_request()).
+
+        Example:
+            # Client disconnects during streaming
+            engine.abort(request_id=5)
+            # → tracker finishes stream with CancelledError
+            # → scheduler frees KV cache blocks
+            # → internal mappings cleaned up
+        """
+        # (1) Tracker cleanup: finishes stream, puts request_id in _aborted_requests.
+        #     The stream consumer (async for loop in API layer) will receive
+        #     a CancelledError when it reads from the queue.
+        #     abort_request() is idempotent: calling it on an already-finished
+        #     stream simply adds to _aborted_requests (which will be deduplicated
+        #     by get_new_and_aborted_requests).
+        self._request_tracker.abort_request(
+            request_id,
+            exception=asyncio.CancelledError(),
+        )
+
+        # (2) Scheduler cleanup: free KV cache blocks.
+        #     Look up seq_id from reverse mapping (request_id → seq_id).
+        #     pop() returns None if request_id not in mapping (already cleaned up
+        #     in a previous abort call or the request was never fully landed).
+        seq_id = self._request_to_seq.pop(request_id, None)
+        if seq_id is not None:
+            # Abort the sequence in scheduler: marks FINISHED, frees blocks,
+            # removes from waiting/running deques.
+            self.engine.scheduler.abort_sequence(seq_id)
+            # Also clean the forward mapping (seq_id → request_id).
+            # This prevents stale entries if _engine_step() later tries to
+            # look up request_id from a seq_id that no longer exists.
+            self._seq_to_request.pop(seq_id, None)
+
+        # (3) Prompt map cleanup.
+        #     Remove stored prompt_token_ids for this request.
+        #     Pop is safe even if request was never added to _prompt_map.
+        self._prompt_map.pop(request_id, None)
 
     # =========================================================================
     # Lifecycle Management

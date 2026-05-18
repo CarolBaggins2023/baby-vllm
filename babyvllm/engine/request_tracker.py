@@ -393,6 +393,84 @@ class RequestTracker:
         if stream is not None:
             stream.finish(exception=exception)
 
+    def process_exception(
+        self,
+        request_id: int,
+        exception: BaseException,
+    ) -> None:
+        """
+        Propagate an engine-level exception to a specific request's stream.
+
+        Delegates to abort_request with the exception. The stream consumer
+        (async generator) will raise the exception when it reads from the queue.
+
+        Why this exists:
+          When _add_request_to_engine() fails for a single request (e.g., invalid
+          sampling params, resource allocation failure), we want to notify only
+          that request's client. Other concurrent requests should continue
+          unaffected. This is the "Level 1" (per-request) error handling.
+
+        How it works:
+          abort_request() does two things:
+            1. Puts request_id in _aborted_requests queue (engine loop will
+               clean up scheduler state on next iteration)
+            2. Finishes the AsyncStream with the given exception, which causes
+               the consumer's async for loop to raise it
+
+        Args:
+            request_id: Internal engine request ID to fail.
+            exception: The exception to propagate (e.g., ValueError, TypeError).
+
+        Example:
+            try:
+                engine._add_request_to_engine(request_data)
+            except ValueError as e:
+                tracker.process_exception(request_data["request_id"], e)
+                # The API layer's async for loop will raise ValueError
+                # Other concurrent requests continue unaffected
+        """
+        self.abort_request(request_id, exception=exception)
+
+    def process_exception_all(
+        self,
+        exception: BaseException,
+    ) -> None:
+        """
+        Propagate an engine-level exception to ALL active request streams.
+
+        Called when a catastrophic engine failure occurs (e.g., GPU OOM,
+        CUDA error, multiprocessing failure). Since the engine operates on
+        all sequences as a single batch, a failure affects all in-flight
+        requests simultaneously.
+
+        Why this exists:
+          This is the "Level 2" (catastrophic) error handler. Unlike
+          process_exception() which targets a single request, this method
+          fans out the exception to every active stream. All clients will
+          see the same exception in their async for loop.
+
+        Design note — tuple() snapshot:
+          Uses tuple(self._request_streams.keys()) to create a snapshot of
+          request IDs before iterating. This is necessary because
+          abort_request() internally calls _request_streams.pop(request_id),
+          which mutates the dict during iteration. Without the snapshot,
+          the iteration would raise RuntimeError: dictionary changed size.
+
+        Args:
+            exception: The exception to propagate to all request streams.
+                       (e.g., torch.cuda.OutOfMemoryError, RuntimeError)
+
+        Example:
+            try:
+                engine.step()
+            except torch.cuda.OutOfMemoryError as e:
+                tracker.process_exception_all(e)
+                # All clients' async for loops will raise OutOfMemoryError
+                # All scheduler sequences cleaned up separately
+        """
+        for request_id in tuple(self._request_streams.keys()):
+            self.abort_request(request_id, exception=exception)
+
     def get_new_and_aborted_requests(self) -> tuple[list[dict], set[int]]:
         """
         Get pending new requests and requests to cancel.

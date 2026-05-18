@@ -29,8 +29,9 @@ class LLMEngine:
     def __init__(self, model, **kwargs):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k:v for k, v in kwargs.items() if k in config_fields}
-        config = Config(model, **config_kwargs)
-        
+        self.config = Config(model, **config_kwargs)
+        config = self.config
+
         # Create and start multiple worker processes.
         # Get Pytorch multiprocessing context and use `spawn` mode instead of 'fork' mode to create worker processes.
         ctx = mp.get_context("spawn")

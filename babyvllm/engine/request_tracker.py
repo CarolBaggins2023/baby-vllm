@@ -39,13 +39,12 @@ from babyvllm.engine.outputs import RequestOutput
 #   using a custom sentinel clearly distinguishes "normal stream end" from "unexpected None".
 #   Reference: asyncio.Queue commonly uses sentinel pattern in Python standard library.
 #
-# Why subclass of BaseException?
-#   Reference: _is_raisable check in vllm.
-#   When STOP_ITERATION is placed in the queue, the consumer (generator)
-#   exits normally after detecting the sentinel, rather than raising an exception.
-#   If a real exception (like CancelledError) is passed, it will be raised.
+# Why a plain object (not an Exception instance)?
+#   STOP_ITERATION must NOT pass the _is_raisable check — it is a sentinel
+#   that tells the consumer to exit normally via StopAsyncIteration.
+#   If it were a BaseException instance, the generator would raise it instead.
 # ---------------------------------------------------------------------------
-STOP_ITERATION = Exception()  # Sentinel, not a real exception
+STOP_ITERATION = object()  # Sentinel, not a real exception
 
 
 # ===========================================================================
@@ -199,10 +198,11 @@ class _AsyncStreamIter:
         if self._exhausted:
             raise StopAsyncIteration
         result = await self._stream._queue.get()
+        if result is STOP_ITERATION:
+            self._exhausted = True
+            raise StopAsyncIteration
         if self._stream._is_raisable(result):
             self._exhausted = True
-            if result is STOP_ITERATION:
-                raise StopAsyncIteration
             raise result
         return result
 
@@ -267,6 +267,9 @@ class RequestTracker:
         # Pending new requests queue: elements are (AsyncStream, dict) tuples
         # dict contains {"request_id": int, "prompt_token_ids": [...], ...}
         self._new_requests: asyncio.Queue = asyncio.Queue()
+        # Track request_ids that are still in _new_requests (not yet claimed).
+        # asyncio.Queue doesn't support O(1) membership test, so we mirror the ids here.
+        self._pending_request_ids: set[int] = set()
         # Pending cancellation request IDs queue
         self._aborted_requests: asyncio.Queue = asyncio.Queue()
         # Event: set() when new requests arrive, engine loop waits on this event for idle sleep
@@ -338,7 +341,7 @@ class RequestTracker:
             async for output in stream.generator():
                 print(f"Request {output.request_id}: {output.text}")
         """
-        if request_id in self._request_streams:
+        if request_id in self._request_streams or request_id in self._pending_request_ids:
             raise KeyError(f"Request {request_id} already exists.")
 
         # Create abort hook: automatically call tracker.abort_request when stream is cancelled.
@@ -352,6 +355,7 @@ class RequestTracker:
             "sampling_params": sampling_params,
             **extra_kwargs,
         }))
+        self._pending_request_ids.add(request_id)
 
         # Wake up engine loop if it's waiting
         self.new_requests_event.set()
@@ -380,6 +384,9 @@ class RequestTracker:
             tracker.abort_request(request_id=1, exception=asyncio.CancelledError())
         """
         self._aborted_requests.put_nowait(request_id)
+
+        # If request is still pending (not yet claimed), remove it
+        self._pending_request_ids.discard(request_id)
 
         # If request is still active, immediately finish its stream
         stream = self._request_streams.pop(request_id, None)
@@ -421,6 +428,7 @@ class RequestTracker:
         while not self._new_requests.empty():
             stream, request_data = self._new_requests.get_nowait()
             request_id = stream.request_id
+            self._pending_request_ids.discard(request_id)
 
             # Edge case: request cancelled immediately after being added to new queue
             if request_id in aborted_request_ids:
@@ -452,6 +460,7 @@ class RequestTracker:
         new_requests: list[dict] = []
         while not self._new_requests.empty():
             stream, request_data = self._new_requests.get_nowait()
+            self._pending_request_ids.discard(stream.request_id)
             # Register as active request
             self._request_streams[stream.request_id] = stream
             new_requests.append(request_data)

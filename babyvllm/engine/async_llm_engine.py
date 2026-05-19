@@ -125,31 +125,48 @@ class AsyncLLMEngine:
         await engine.stop()
     """
 
-    def __init__(self, model: str, **kwargs):
+    def __init__(self, model: Optional[str] = None, engine: Optional[LLMEngine] = None, **kwargs):
         """
         Create AsyncLLMEngine instance. Does not start background loop (lazy startup, see generate()).
 
         Initialization Order:
-          1. Create underlying synchronous LLMEngine → load model, start worker processes
+          1. Create or reuse underlying synchronous LLMEngine → load model, start worker processes
           2. Create RequestTracker → prepare _new_requests queue
           3. Initialize async primitives → stop signal, mappings, counters
 
         Args:
-            model: Model path (local directory), passed to Config(model, **kwargs)
+            model: Model path (local directory), passed to Config(model, **kwargs).
+                   Required if `engine` is not provided.
+            engine: Optional pre-existing LLMEngine instance. When provided, `model` and
+                    **kwargs are ignored — the passed engine is used directly.
+                    Useful for sharing a single engine across sync and async test fixtures.
             **kwargs: Configuration parameters, passed to LLMEngine.__init__() → Config constructor.
+                      Ignored when `engine` is provided.
 
         Resource Notes:
-          - LLMEngine.__init__() internally starts model_runner processes (cleaned up via atexit)
+          - When creating a new engine: LLMEngine.__init__() internally starts model_runner
+            processes (cleaned up via atexit)
+          - When reusing an existing engine: resource lifecycle is managed by the original owner
           - Background loop Task not created (lazy startup)
           - After this method returns, engine is in "ready but not running" state
         """
 
         # (1) Underlying Synchronous Engine
+        # Two modes:
+        #   a) Pass an existing LLMEngine → reuse it (avoids double-loading model)
+        #   b) Pass model path → create a new LLMEngine
         # LLMEngine is responsible for:
         #   - Model loading + multi-process Worker (ModelRunner via multiprocessing.spawn)
         #   - Tokenizer (HuggingFace AutoTokenizer: encode / decode)
         #   - Scheduler (sequence scheduling + KV Cache Block allocation)
-        self.engine = LLMEngine(model, **kwargs)
+        if engine is not None:
+            self.engine = engine
+        elif model is not None:
+            self.engine = LLMEngine(model, **kwargs)
+        else:
+            raise ValueError(
+                "Either `model` or `engine` must be provided to AsyncLLMEngine."
+            )
 
         # (2) Convenient Tokenizer Reference
         # engine.tokenizer returns HuggingFace AutoTokenizer instance.
@@ -755,6 +772,13 @@ class AsyncLLMEngine:
         #   - ensure_future() wraps coroutine as Task and schedules it immediately
         #   - Equivalent to create_task() (Python 3.7+), but ensure_future is more general
         if self._engine_task is None or self._engine_task.done():
+            self._stop_event = asyncio.Event()
+            # Recreate RequestTracker to bind its asyncio primitives
+            # (new_requests_event, queues) to the current event loop.
+            # Without this, primitives created in __init__ (possibly a
+            # different loop) cause RuntimeError when Event.wait() checks
+            # loop affinity via _get_loop().
+            self._request_tracker = RequestTracker()
             self._engine_task = asyncio.ensure_future(
                 self._run_engine_loop()
             )

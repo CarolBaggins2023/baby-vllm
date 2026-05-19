@@ -27,6 +27,9 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+    "gpu: tests that require a CUDA-capable GPU and a model (set BABYVLLM_TEST_MODEL env var)",
+]
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]

@@ -63,9 +63,15 @@ class LLMEngine:
         
     def exit(self):
         """ Clean up resources when the program exits. """
-        
-        self.model_runner.call('exit')
-        del self.model_runner
+
+        # WHY: guard with hasattr because exit() may be called both explicitly
+        # AND by atexit. After explicit exit() deletes model_runner, the
+        # atexit-registered copy would raise AttributeError.
+        # Example: engine.exit() → del model_runner → atexit fires →
+        #          engine.exit() again → hasattr returns False → safe skip.
+        if hasattr(self, 'model_runner') and self.model_runner is not None:
+            self.model_runner.call('exit')
+            del self.model_runner
         # Wait for all worker processes to finish.
         for process in self.processes:
             process.join()

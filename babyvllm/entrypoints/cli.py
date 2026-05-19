@@ -204,6 +204,16 @@ Examples:
         "enforce_eager": args.enforce_eager,
         "kvcache_block_size": args.kvcache_block_size,
         "num_kvcache_blocks": args.num_kvcache_blocks,
+        # WHY: Forward host/port into Config so it is the single source of truth.
+        # Later, cli.py reads them back from engine.engine.config instead of raw
+        # args.  This means: if some middleware modified the config (e.g. for
+        # testing or dynamic reconfiguration), uvicorn uses the canonical values.
+        #
+        # Note: CLI --host defaults to "127.0.0.1" (secure local-only default),
+        # which overrides Config.host default of "0.0.0.0" (permissive library
+        # default).  CLI --port defaults to 8000, same as Config.
+        "host": args.host,
+        "port": args.port,
     }
 
     # max_model_len is optional — only set if user explicitly provided it.
@@ -281,11 +291,23 @@ Examples:
     #   3. Python process exits
     # =====================================================================
 
-    print(f"Starting server on {args.host}:{args.port}...")
+    # WHY: Read host/port from engine.engine.config instead of raw CLI args.
+    # At this point engine_kwargs (which included host/port) has been piped
+    # through LLMEngine.__init__ → Config.__init__ → Config.__post_init__
+    # validation.  So engine.engine.config holds the validated, canonical
+    # values.  Using raw args would bypass validation — e.g. if a bug let an
+    # out-of-range port into args, it would only be caught here by uvicorn
+    # (late failure), not by Config.__post_init__ (early failure).
+    #
+    # Example: args.port=99999 survives argparse (which only checks type=int),
+    # but Config.__post_init__ raises AssertionError("port must be between
+    # 1 and 65535") before the model is loaded.  Then this code never runs —
+    # a fast failure rather than a slow failure after GPU allocation.
+    print(f"Starting server on {engine.engine.config.host}:{engine.engine.config.port}...")
     uvicorn.run(
         api_server.app,
-        host=args.host,
-        port=args.port,
+        host=engine.engine.config.host,
+        port=engine.engine.config.port,
         log_level=args.log_level,
     )
 

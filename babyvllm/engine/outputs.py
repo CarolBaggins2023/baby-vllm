@@ -14,6 +14,7 @@ Relationship with offline mode:
 """
 
 from dataclasses import dataclass
+from typing import Optional
 
 
 # ---------------------------------------------------------------------------
@@ -78,3 +79,10 @@ class RequestOutput:
     token_ids: list[int]
     finished: bool
     prompt_token_ids: list[int]
+    # Per-request timing metrics (populated only when finished=True in online mode).
+    # These are approximations in the current engine since engine.step() only
+    # reports completed sequences; they will become precise when per-step
+    # incremental output is supported.
+    ttft: Optional[float] = None       # Time to first token (seconds)
+    tpot: Optional[float] = None       # Time per output token (seconds)
+    total_time: Optional[float] = None # Total inference time for this request (seconds)

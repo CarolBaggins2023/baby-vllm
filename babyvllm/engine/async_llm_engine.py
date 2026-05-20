@@ -79,6 +79,7 @@ Architecture Overview (Data Flow + Control Flow)
 
 import asyncio
 import itertools
+import time
 from typing import AsyncGenerator, Optional, Union
 
 from babyvllm.engine.llm_engine import LLMEngine
@@ -210,6 +211,12 @@ class AsyncLLMEngine:
         #   Independent storage avoids dependency on Sequence object lifecycle.
         self._prompt_map: dict[int, list[int]] = {}
 
+        # request_id → timing info for per-request metrics collection.
+        # Written in add_request() (arrival_time), read and popped during
+        # output routing phase in _engine_step() when the request finishes.
+        # Structure: {"arrival_time": float}
+        self._request_timings: dict[int, dict] = {}
+
         # (5) Background Loop and Lifecycle
         # Background loop Task reference. Initially None, lazily created on first generate() call.
         # Wraps _run_engine_loop() coroutine using asyncio.ensure_future().
@@ -330,6 +337,11 @@ class AsyncLLMEngine:
         #     retrieve prompt_token_ids via request_id to construct RequestOutput.
         #     Entry is popped after request completes.
         self._prompt_map[request_id] = prompt_token_ids
+
+        # (3b) Record arrival time for per-request timing metrics.
+        #     Used in _engine_step() to compute TTFT/TPOT/total_time
+        #     when the request's output is routed.
+        self._request_timings[request_id] = {"arrival_time": time.time()}
 
         # (4) Register request in RequestTracker and get AsyncStream.
         #     Note: Sequence not created yet, nor moved from _new_requests to _request_streams.
@@ -473,8 +485,9 @@ class AsyncLLMEngine:
                 self.engine.scheduler.abort_sequence(seq_id)
                 # Clean forward mapping
                 self._seq_to_request.pop(seq_id, None)
-            # Clean prompt map
+            # Clean prompt map and timing data
             self._prompt_map.pop(request_id, None)
+            self._request_timings.pop(request_id, None)
 
         # =====================================================================
         # (3) Land new requests to scheduler
@@ -534,6 +547,7 @@ class AsyncLLMEngine:
             self._seq_to_request.clear()
             self._request_to_seq.clear()
             self._prompt_map.clear()
+            self._request_timings.clear()
 
             # Re-raise to crash the background loop.
             # The API layer will see the exception through the streams
@@ -580,6 +594,24 @@ class AsyncLLMEngine:
             # Decode completion tokens to text
             text = self.tokenizer.decode(completion_token_ids)
 
+            # Compute per-request timing metrics.
+            # In the current engine, engine.step() only returns completed
+            # sequences, so these are end-to-end values. TTFT is approximated
+            # as the full latency (arrival -> completion), and TPOT is the
+            # average time per generated token. These will become precise
+            # when per-step incremental output is supported.
+            ttft = None
+            tpot = None
+            total_time = None
+            if request_id in self._request_timings:
+                timing = self._request_timings.pop(request_id)
+                arrival = timing["arrival_time"]
+                completion = time.time()
+                total_time = completion - arrival
+                num_tokens = len(completion_token_ids)
+                ttft = total_time  # end-to-end latency as TTFT proxy
+                tpot = total_time / num_tokens if num_tokens > 0 else 0.0
+
             # Build RequestOutput
             request_outputs.append(RequestOutput(
                 request_id=request_id,
@@ -587,6 +619,9 @@ class AsyncLLMEngine:
                 token_ids=completion_token_ids,
                 finished=True,
                 prompt_token_ids=prompt_token_ids,
+                ttft=ttft,
+                tpot=tpot,
+                total_time=total_time,
             ))
 
         # Batch route all outputs to corresponding streams
@@ -877,6 +912,11 @@ class AsyncLLMEngine:
         #     Remove stored prompt_token_ids for this request.
         #     Pop is safe even if request was never added to _prompt_map.
         self._prompt_map.pop(request_id, None)
+
+        # (4) Timing data cleanup.
+        #     Remove timing info for this request to prevent memory leaks.
+        #     Pop is safe even if request was never added to _request_timings.
+        self._request_timings.pop(request_id, None)
 
     # =========================================================================
     # Lifecycle Management

@@ -30,7 +30,8 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k:v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
-        
+        self.config = config
+
         # Create and start multiple worker processes.
         # Get Pytorch multiprocessing context and use `spawn` mode instead of 'fork' mode to create worker processes.
         ctx = mp.get_context("spawn")
@@ -62,9 +63,10 @@ class LLMEngine:
         
     def exit(self):
         """ Clean up resources when the program exits. """
-        
-        self.model_runner.call('exit')
-        del self.model_runner
+
+        if hasattr(self, 'model_runner') and self.model_runner is not None:
+            self.model_runner.call('exit')
+            del self.model_runner
         # Wait for all worker processes to finish.
         for process in self.processes:
             process.join()
@@ -90,14 +92,14 @@ class LLMEngine:
         self.scheduler.add_sequence(seq)
         return len(prompt_token_ids)
 
-    def step(self) -> tuple[list[int], int]:
+    def step(self) -> list[tuple[int, list[int]]]:
         """ Run the model for scheduled sequences. """
-        
+
         # (1) Schedule sequences.
         scheduled_sequences = self.scheduler.schedule()
         # There is no sequence to schedule.
         if not scheduled_sequences:
-            return [], 0
+            return []
         
         # (2) Run the model.
         outputs = self.model_runner.call('run', scheduled_sequences)

@@ -261,4 +261,19 @@ class Scheduler:
                 # The sequence is still in chunked prefilling phase.
                 # Ignore its output token.
                 pass
-    
+
+    def abort_sequence(self, seq_id: int) -> bool:
+        """Abort a sequence by seq_id. Free KV cache blocks and remove from deques."""
+        for i, seq in enumerate(self.waiting):
+            if seq.seq_id == seq_id:
+                seq.status = SequenceStatus.FINISHED
+                self.block_manager.deallocate(seq)
+                del self.waiting[i]
+                return True
+        for i, seq in enumerate(self.running):
+            if seq.seq_id == seq_id:
+                seq.status = SequenceStatus.FINISHED
+                self.block_manager.deallocate(seq)
+                del self.running[i]
+                return True
+        return False

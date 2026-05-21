@@ -15,6 +15,8 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    host: str = "0.0.0.0"
+    port: int = 8000
     # Store some configs in huggingface' config.
     hf_config: AutoConfig | None = None
     
@@ -26,4 +28,7 @@ class Config:
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_length = min(self.max_model_length, self.hf_config.max_position_embeddings)
+        assert self.max_num_batched_tokens >= self.max_model_length
+        assert isinstance(self.host, str) and len(self.host) > 0
+        assert isinstance(self.port, int) and 1 <= self.port <= 65535
     

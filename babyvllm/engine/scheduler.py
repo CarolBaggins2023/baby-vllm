@@ -243,8 +243,17 @@ class Scheduler:
             # ======================
             if seq.num_computed_tokens >= seq.num_tokens:
                 # The sequence has finished prefilling phase or it is already in decoding phase.
+
+                # Check max_tokens BEFORE appending so that max_tokens=0
+                # finishes immediately without generating any completion tokens.
+                if seq.num_completion_tokens >= seq.max_tokens:
+                    seq.status = SequenceStatus.FINISHED
+                    self.block_manager.deallocate(seq)
+                    self.running.remove(seq)
+                    continue
+
                 seq.append_token(token_id)
-                
+
                 # In following cases, a sequence will stop append new tokens:
                 # (a) The eos token is generated.
                 stop_check_eos = not seq.ignore_eos and token_id == self.eos
@@ -252,7 +261,7 @@ class Scheduler:
                 stop_check_max_completion = seq.num_completion_tokens >= seq.max_tokens
                 # (c) The sequence length exceeds the maximum model length.
                 stop_check_max_model_len = seq.max_model_length is not None and len(seq) >= seq.max_model_length
-                
+
                 if stop_check_eos or stop_check_max_completion or stop_check_max_model_len:
                     seq.status = SequenceStatus.FINISHED
                     self.block_manager.deallocate(seq)

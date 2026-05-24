@@ -32,32 +32,42 @@ class LLMEngine:
         config = Config(model, **config_kwargs)
         self.config = config
 
-        # Create and start multiple worker processes.
-        # Get Pytorch multiprocessing context and use `spawn` mode instead of 'fork' mode to create worker processes.
-        ctx = mp.get_context("spawn")
-        # `processes` stores all worker processes and is used to manage them, such as wait for them to finish.
+        # Track partially-initialized state so that if construction fails
+        # midway we can clean up GPU memory.
+        self.model_runner = None
         self.processes = []
-        # `events` stores all events that are used to communicate between the main process and worker processes.
         self.events = []
-        for i in range(1, config.tensor_parallel_size):
-            event = ctx.Event()
-            process = ctx.Process(target=worker_process, args=(config, i, event))
-            self.processes.append(process)
-            self.events.append(event)
-            process.start()
-        # Model runner in the main process will coordinate model execution in worker processes.
-        self.model_runner = ModelRunner(config, rank=0, event=self.events)
-        
+
+        try:
+            # Create and start multiple worker processes.
+            # Get Pytorch multiprocessing context and use `spawn` mode instead of 'fork' mode to create worker processes.
+            ctx = mp.get_context("spawn")
+            # `processes` stores all worker processes and is used to manage them, such as wait for them to finish.
+            # `events` stores all events that are used to communicate between the main process and worker processes.
+            for i in range(1, config.tensor_parallel_size):
+                event = ctx.Event()
+                process = ctx.Process(target=worker_process, args=(config, i, event))
+                self.processes.append(process)
+                self.events.append(event)
+                process.start()
+            # Model runner in the main process will coordinate model execution in worker processes.
+            self.model_runner = ModelRunner(config, rank=0, event=self.events)
+        except Exception:
+            # If ModelRunner construction fails, clean up GPU memory and
+            # worker processes to avoid leaking memory.
+            self.exit()
+            raise
+
         # Tokenizer will convert input text into token ids before model execution,
         # and convert token ids back to text after model execution.
         self.tokenizer = AutoTokenizer.from_pretrained(config.model)
-        
+
         # Adapt the block size of Sequence to the kv cache block size.
         Sequence.block_size = config.kvcache_block_size
-        
+
         # Construct scheduler after model runner, because scheduler needs to know the number of kv cache blocks.
         self.scheduler = Scheduler(config)
-    
+
         # When the program exits, clean up resources automatically.
         atexit.register(self.exit)
         
@@ -87,7 +97,10 @@ class LLMEngine:
             if prompt is None:
                 raise ValueError("Either prompt or prompt_token_ids must be provided.")
             prompt_token_ids = self.tokenizer.encode(prompt)
-        
+
+        if not prompt_token_ids:
+            return 0
+
         seq = Sequence(token_ids=prompt_token_ids, sampling_params=sampling_params)
         self.scheduler.add_sequence(seq)
         return len(prompt_token_ids)

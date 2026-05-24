@@ -21,7 +21,14 @@ class Config:
     hf_config: AutoConfig | None = None
     
     def __post_init__(self):
-        assert os.path.isdir(self.model)
+        if not os.path.isdir(self.model):
+            raise ValueError(
+                f"Model path does not exist or is not a directory.\n"
+                f"  model (as provided): {self.model}\n"
+                f"  resolved absolute path: {os.path.abspath(self.model)}\n"
+                f"  current working directory: {os.getcwd()}\n"
+                f"  Hint: set BABYVLLM_TEST_MODEL_PATH env var to the correct model directory."
+            )
         # Due to the use of the "flash_dattn",
         # the block size of KV cache must be divisible by 256.
         assert self.kvcache_block_size % 256 == 0

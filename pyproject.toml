@@ -30,6 +30,9 @@ where = ["babyvllm"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+    "gpu: tests that require a real GPU (CUDA).",
+]
 
 [dependency-groups]
 dev = [

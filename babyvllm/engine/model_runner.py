@@ -29,16 +29,17 @@ class ModelRunner:
         # For rank 0, `event` is a list of events, which size is `world_size-1`.
         # For rank i > 0, `event` is a single event.
         self.event = event
-        
+
         # Set parameters for distributed inference.
         self.world_size = config.tensor_parallel_size
         self.block_size = config.kvcache_block_size
         # Whether to enforce eager execution when running model.
         self.enforce_eager = config.enforce_eager
-        
+
         # Initialize distributed process group.
         self.rank = rank
-        dist.init_process_group(backend='nccl', init_method='tcp://localhost:12345', world_size=config.tensor_parallel_size, rank=rank)
+        if not dist.is_initialized():
+            dist.init_process_group(backend='nccl', init_method='tcp://localhost:12345', world_size=config.tensor_parallel_size, rank=rank)
         torch.cuda.set_device(rank)
         torch.set_default_device(f'cuda:{rank}')
 
@@ -47,22 +48,32 @@ class ModelRunner:
 
         # Set by prepare_forward() and consumed by run() to avoid re-computing is_decode_only.
         self._is_decode_only = False
-        
-        # Create model and sampler.
-        self.model = Qwen3ForCausalLM(config.hf_config).cuda(rank)
-        load_model(self.model, config.model)
-        self.sampler = Sampler()
-        
-        # Get peak memory usage, which is helpful for kv cache allocation.
-        self.warmup_model()
-        # Allocate kv cache.
-        self.allocate_kv_cache()
-        
-        # Capture CUDA graph for decoding.
-        # `self.graphs`: {batch_size : CUDAGraph}
-        if not self.enforce_eager:
-            self.capture_cudagraph()
-        
+
+        # Track model for cleanup on failure.
+        self.model = None
+
+        try:
+            # Create model and sampler.
+            self.model = Qwen3ForCausalLM(config.hf_config).cuda(rank)
+            load_model(self.model, config.model)
+            self.sampler = Sampler()
+
+            # Get peak memory usage, which is helpful for kv cache allocation.
+            self.warmup_model()
+            # Allocate kv cache.
+            self.allocate_kv_cache()
+
+            # Capture CUDA graph for decoding.
+            # `self.graphs`: {batch_size : CUDAGraph}
+            if not self.enforce_eager:
+                self.capture_cudagraph()
+        except Exception:
+            # Clean up GPU memory on partial construction failure.
+            del self.model
+            self.model = None
+            torch.cuda.empty_cache()
+            raise
+
         # Setup shared memory for communication between model runners. (multi-process communication)
         # Rank 0 create the shared memory and child processes link to it.
         # To avoid collision, should be done after all processes finishing model initialization, warmup and kv cache allocation.
@@ -154,12 +165,18 @@ class ModelRunner:
             self.shm.close()
             if self.rank == 0:
                 self.shm.unlink()
-        
+
         # Delete CUDA graphs.
         if not self.enforce_eager:
             del self.graphs, self.graph_vars, self.graph_pool
+
+        # Free model and KV cache to return GPU memory.
+        if hasattr(self, 'model') and self.model is not None:
+            del self.model
+            self.model = None
+        torch.cuda.empty_cache()
         torch.cuda.synchronize()
-        
+
         # Destroy process group.
         if dist.is_initialized():
             dist.destroy_process_group()
@@ -214,30 +231,42 @@ class ModelRunner:
     
     def allocate_kv_cache(self):
         # ===== (1) Find available memory for kv cache. =====
-        # `total_mem` is the total memory of the current device.
-        # `total_mem*self.config.gpu_memory_utilization` is the memory allowed to use, reserving some for other purposes, such as cuda context.
         free_mem, total_mem = torch.cuda.mem_get_info()
-        # `used_mem` is the memory already used, which is cannot be allocated to kv cache.
         used_mem = total_mem-free_mem
-        # `peak_mem_usage` is the maximum allocated memory begin from `reset_peak_memory_stats()` in model warmup,
-        # which is the peak memory usage of the model execution.
         peak_mem_usage = torch.cuda.memory_stats()['allocated_bytes.all.peak']
-        # `current_mem_usage` is the current allocated memory. Because `empty_cache()` is called at the end of model warmup,
-        # current memory usage is much smaller than peak memory usage.
         current_mem_usage = torch.cuda.memory_stats()['allocated_bytes.all.current']
-        # `peak_mem_usage-current_mem_usage` is the possible memory usage increase during model execution,
-        # so it should be reserved to ensure the model can run without OOM.
         available_mem = total_mem*self.config.gpu_memory_utilization-used_mem-peak_mem_usage+current_mem_usage
-        
+
         # ===== (2) Compute kv cache block size and number of available blocks. =====
         num_layers = self.config.hf_config.num_hidden_layers
         num_kv_heads = self.config.hf_config.num_key_value_heads//self.world_size
         head_dim = self.config.hf_config.head_dim
-        # size of one kv cache block in bytes
-        # "*2" because we need to store both key and value.
         block_size_bytes = self.block_size*2*num_layers*num_kv_heads*head_dim*self.default_dtype.itemsize
-        self.config.num_kvcache_blocks = int(available_mem)//block_size_bytes
-        assert self.config.num_kvcache_blocks >= 1, f"Not enough memory to hold even one kv cache block on rank {self.rank}."
+        blocks_from_memory = int(available_mem)//block_size_bytes
+
+        if blocks_from_memory < 1:
+            raise RuntimeError(
+                f"Not enough memory for KV cache on rank {self.rank}. "
+                f"Diagnostics:\n"
+                f"  total_mem={total_mem/1024**3:.2f} GiB\n"
+                f"  free_mem={free_mem/1024**3:.2f} GiB\n"
+                f"  used_mem={used_mem/1024**3:.2f} GiB\n"
+                f"  peak_mem_usage={peak_mem_usage/1024**3:.2f} GiB\n"
+                f"  current_mem_usage={current_mem_usage/1024**3:.2f} GiB\n"
+                f"  gpu_memory_utilization={self.config.gpu_memory_utilization}\n"
+                f"  available_mem={available_mem/1024**3:.2f} GiB\n"
+                f"  block_size_bytes={block_size_bytes/1024**2:.2f} MiB\n"
+                f"  block_size={self.block_size}, num_layers={num_layers}, "
+                f"num_kv_heads={num_kv_heads}, head_dim={head_dim}, "
+                f"dtype_size={self.default_dtype.itemsize}"
+            )
+
+        # Cap the number of blocks at what the scheduler could ever use.
+        # Allocating more than max_num_sequences * max_blocks_per_seq blocks
+        # wastes GPU memory and prevents other engines from coexisting.
+        max_blocks_per_seq = math.ceil(self.config.max_model_length/self.block_size)
+        max_blocks_needed = self.config.max_num_sequences * max_blocks_per_seq
+        self.config.num_kvcache_blocks = min(blocks_from_memory, max_blocks_needed)
     
         # ===== (3) Allocate memory for kv cache. =====
         # Although `allocated_kv_cache` is a local variable, it will not be deleted out of the function,

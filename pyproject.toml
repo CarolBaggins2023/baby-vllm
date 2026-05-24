@@ -28,9 +28,13 @@ package-dir = {"" = "babyvllm"}
 [tool.setuptools.packages.find]
 where = ["babyvllm"]
 
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
 [dependency-groups]
 dev = [
     "pytest>=7.0",
+    "pytest-asyncio>=0.23.0",
     "black>=23.0",
     "isort>=5.0",
 ]

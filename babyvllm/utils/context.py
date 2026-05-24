@@ -1,4 +1,5 @@
 import torch
+import contextvars
 from dataclasses import dataclass
 
 @dataclass
@@ -98,24 +99,73 @@ class Context:
     # Starting offset for the Prefill portion in cu_seqlens_k (= cu_seqlens_k[num_decode_seqs])
     cu_seqlens_k_offset: int = 0
     
-_CONTEXT = Context()
+# ---------------------------------------------------------------------------
+#  To implement online service:
+#    Replace module-level global mutable singleton with contextvars.ContextVar.
+#
+#  Problem Background (before refactoring):
+#    The old code used a module-level global variable `_CONTEXT = Context()` to
+#    store attention metadata. Each call to set_context() directly overwrites
+#    this global object. When multiple requests execute concurrently, different
+#    model forward passes overwrite each other's attention metadata.
+#    It leads to:
+#      - cu_seqlens / block_tables / slot_mapping corruption
+#      - KV cache written to wrong locations, producing random outputs or even
+#        CUDA illegal memory access
+#
+#  Solution:
+#    Python 3.7+'s built-in contextvars module provides "context variables"
+#    (ContextVar), where each asyncio Task has its own independent copy of the
+#    variable.
+#
+#  How it works:
+#      ┌──────────────────────────────────────────────────────┐
+#      │  Task A                    Task B                    │
+#      │  set_context(seqs=[1,2])   set_context(seqs=[3])    │
+#      │       ↓                         ↓                   │
+#      │  _context_var:             _context_var:            │
+#      │    {seqs: [1,2]}             {seqs: [3]}            │
+#      │       ↓                         ↓                   │
+#      │  get_context() → [1,2]     get_context() → [3]      │
+#      └──────────────────────────────────────────────────────┘
+#    Values written via set() by each Task are only visible to itself and
+#    child Tasks derived from it. Tasks are completely isolated and do not
+#    interfere with each other.
+#
+#  Why not threading.local:
+#    threading.local isolates by thread, but multiple asyncio coroutines may
+#    share the same thread. In this case, threading.local cannot distinguish
+#    between different Tasks, leading to the same conflicts as global variables.
+#
+#  Why not multiprocessing.Manager:
+#    The model needs to read context at each inference step. Manager's IPC
+#    latency (~microsecond level) would seriously slow down inference throughput.
+#    ContextVar is a pure C-implemented thread/coroutine local storage with
+#    negligible overhead.
+# ---------------------------------------------------------------------------
+# ContextVar itself is a module-level shared "key", but each Task uses this key
+# to open its own "locker". default=Context() ensures that in environments where
+# set() has not been called explicitly (e.g., single-threaded offline inference),
+# get() returns a clean default Context, behaving exactly as before refactoring.
+_context_var: contextvars.ContextVar[Context] = contextvars.ContextVar(
+    'context', default=Context()
+)
 
 def get_context() -> Context:
-    return _CONTEXT
+    return _context_var.get()
 
 def reset_context():
-    global _CONTEXT
-    _CONTEXT = Context()
+    _context_var.set(Context())
 
 def set_context(
-    is_prefill,
+    is_prefill: bool,
     cu_seqlens_q = None,
-    max_seqlen_q = 0,
+    max_seqlen_q: int = 0,
     cu_seqlens_k = None,
-    max_seqlen_k = 0,
-    slot_mapping=None,
-    block_tables=None,
-    context_lens=None,
+    max_seqlen_k: int = 0,
+    slot_mapping = None,
+    block_tables = None,
+    context_lens = None,
     num_decode_seqs: int = 0,
     num_decode_tokens: int = 0,
     prefill_max_seqlen_q: int = 0,
@@ -123,21 +173,13 @@ def set_context(
     cu_seqlens_q_offset: int = 0,
     cu_seqlens_k_offset: int = 0,
 ):
-    global _CONTEXT
-    _CONTEXT = Context(
+    _context_var.set(Context(
         is_prefill,
-        cu_seqlens_q,
-        max_seqlen_q,
-        cu_seqlens_k,
-        max_seqlen_k,
-        slot_mapping,
-        block_tables,
-        context_lens,
-        num_decode_seqs,
-        num_decode_tokens,
-        prefill_max_seqlen_q,
-        prefill_max_seqlen_k,
-        cu_seqlens_q_offset,
-        cu_seqlens_k_offset,
-    )
+        cu_seqlens_q, max_seqlen_q,
+        cu_seqlens_k, max_seqlen_k,
+        slot_mapping, block_tables, context_lens,
+        num_decode_seqs, num_decode_tokens,
+        prefill_max_seqlen_q, prefill_max_seqlen_k,
+        cu_seqlens_q_offset, cu_seqlens_k_offset,
+    ))
     

@@ -21,14 +21,41 @@ class Config:
     hf_config: AutoConfig | None = None
     
     def __post_init__(self):
+        # Normalize the model path: expand ~ and convert to absolute path early.
+        self.model = os.path.abspath(os.path.expanduser(self.model))
+
         if not os.path.isdir(self.model):
-            raise ValueError(
-                f"Model path does not exist or is not a directory.\n"
-                f"  model (as provided): {self.model}\n"
-                f"  resolved absolute path: {os.path.abspath(self.model)}\n"
-                f"  current working directory: {os.getcwd()}\n"
-                f"  Hint: set BABYVLLM_TEST_MODEL_PATH env var to the correct model directory."
+            # Build a rich diagnostic message.
+            parts = [
+                f"Model path does not exist or is not a directory.",
+                f"  model (resolved): {self.model}",
+                f"  current working directory: {os.getcwd()}",
+            ]
+
+            home_dir = os.path.expanduser("~")
+            # Check if the parent of the resolved path exists; if so, list
+            # siblings to help the user spot a typo.
+            parent = os.path.dirname(self.model)
+            if os.path.isdir(parent):
+                siblings = sorted(os.listdir(parent))[:20]
+                parts.append(f"  parent directory '{parent}' exists; contents (first 20): {siblings}")
+            else:
+                parts.append(f"  parent directory '{parent}' does NOT exist either")
+
+            # Reconstruct the relative path (from CWD) and check if it
+            # exists under $HOME instead — common when user forgets a
+            # leading slash on an absolute path like /root/autodl-tmp/...
+            rel = os.path.relpath(self.model, os.getcwd())
+            home_candidate = os.path.join(home_dir, rel)
+            if os.path.isdir(home_candidate):
+                parts.append(f"  DID find model under $HOME: {home_candidate}")
+                parts.append(f"  → try: BABYVLLM_TEST_MODEL_PATH={home_candidate}")
+
+            parts.append(
+                f"  Hint: set BABYVLLM_TEST_MODEL_PATH to an absolute path, e.g.\n"
+                f"        BABYVLLM_TEST_MODEL_PATH=/root/autodl-tmp/Qwen/Qwen3-0.6B"
             )
+            raise ValueError("\n".join(parts))
         # Due to the use of the "flash_dattn",
         # the block size of KV cache must be divisible by 256.
         assert self.kvcache_block_size % 256 == 0

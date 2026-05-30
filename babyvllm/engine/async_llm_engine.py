@@ -82,7 +82,8 @@ import itertools
 import time
 from typing import AsyncGenerator, Optional, Union
 
-from babyvllm.engine.llm_engine import LLMEngine
+# LLMEngine imported lazily inside __init__ to avoid triggering GPU/model
+# dependencies during unit-test imports of AsyncLLMEngine.
 from babyvllm.engine.request_tracker import RequestTracker
 from babyvllm.engine.outputs import RequestOutput
 from babyvllm.engine.sequence import Sequence
@@ -163,6 +164,7 @@ class AsyncLLMEngine:
         if engine is not None:
             self.engine = engine
         elif model is not None:
+            from babyvllm.engine.llm_engine import LLMEngine
             self.engine = LLMEngine(model, **kwargs)
         else:
             raise ValueError(
@@ -225,6 +227,15 @@ class AsyncLLMEngine:
         # Stop signal. After set(), background loop exits on next iteration.
         # Uses asyncio.Event instead of threading.Event (entire control flow is in asyncio).
         self._stop_event = asyncio.Event()
+
+        # (6) Current Request ID for Cancellation
+        # Set in generate() after add_request() returns, before first async yield.
+        # Used by API layer's CancelledError handler as a fallback when the client
+        # disconnects before the first RequestOutput is yielded (engine_request_id
+        # would otherwise still be None).
+        # This is set BEFORE any async operation in generate(), so within a single
+        # coroutine it is stable — Python asyncio is cooperative, not preemptive.
+        self._current_request_id: Optional[int] = None
 
     @property
     def engine_started(self) -> bool:
@@ -852,7 +863,15 @@ class AsyncLLMEngine:
                 f"prompt must be str or list[int], got {type(prompt)}."
             )
 
-        # (3) Async consume stream and yield one by one
+        # (3) Expose request_id for cancellation fallback BEFORE first async yield.
+        # If a client disconnects during prefill (before the first RequestOutput
+        # is yielded), the API layer's CancelledError handler needs engine_request_id
+        # to call abort() and free KV cache blocks. By storing it here synchronously
+        # (before any await), we guarantee _current_request_id is available when
+        # CancelledError arrives, even during the very first __anext__() call.
+        self._current_request_id = rid
+
+        # (4) Async consume stream and yield one by one
         # stream.generator() returns _AsyncStreamIter object.
         #
         # Note: In current implementation, engine.step() only produces output when sequence completes,

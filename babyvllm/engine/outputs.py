@@ -13,8 +13,6 @@ Relationship with offline mode:
   results in dict format. The two modes operate independently.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Optional
 

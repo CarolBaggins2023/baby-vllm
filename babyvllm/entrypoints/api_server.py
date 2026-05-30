@@ -1377,8 +1377,13 @@ async def _non_stream_completion(
         # Although AsyncStream.aclose() also triggers abort via the cancel hook,
         # explicitly calling abort() provides defense-in-depth and cleans up
         # AsyncLLMEngine internal mappings (_request_to_seq, _seq_to_request, _prompt_map).
-        if engine_request_id is not None:
-            _engine.abort(engine_request_id)
+        #
+        # Use engine_request_id if captured from output, otherwise fall back to the
+        # engine's _current_request_id (set in generate() before first yield).
+        # This handles client disconnect before any RequestOutput is generated.
+        abort_id = engine_request_id if engine_request_id is not None else _engine._current_request_id
+        if abort_id is not None:
+            _engine.abort(abort_id)
         raise  # Re-raise so FastAPI knows the request was cancelled
 
     if final_output is None:
@@ -1469,8 +1474,13 @@ async def _non_stream_chat_completion(
         # Client disconnected — ensure engine-side cleanup.
         # Although AsyncStream.aclose() also triggers abort via the cancel hook,
         # explicitly calling abort() provides defense-in-depth.
-        if engine_request_id is not None:
-            _engine.abort(engine_request_id)
+        #
+        # Use engine_request_id if captured from output, otherwise fall back to the
+        # engine's _current_request_id (set in generate() before first yield).
+        # This handles client disconnect before any RequestOutput is generated.
+        abort_id = engine_request_id if engine_request_id is not None else _engine._current_request_id
+        if abort_id is not None:
+            _engine.abort(abort_id)
         raise  # Re-raise so FastAPI knows the request was cancelled
 
     if final_output is None:
@@ -1630,8 +1640,13 @@ async def _stream_completion(
         #   - Makes the cleanup path visible in the code
         #   - Cleans up AsyncLLMEngine internal mappings that the
         #     tracker alone cannot touch (_request_to_seq, _seq_to_request, _prompt_map)
-        if engine_request_id is not None:
-            _engine.abort(engine_request_id)
+        #
+        # Use engine_request_id if captured from output, otherwise fall back to the
+        # engine's _current_request_id (set in generate() before first yield).
+        # This handles client disconnect before any RequestOutput is generated.
+        abort_id = engine_request_id if engine_request_id is not None else _engine._current_request_id
+        if abort_id is not None:
+            _engine.abort(abort_id)
         # Do NOT re-raise. Starlette's StreamingResponse internally catches
         # CancelledError when client disconnects. Re-raising would cause
         # unexpected behavior in the HTTP layer.
@@ -1746,6 +1761,11 @@ async def _stream_chat_completion(
         #   - Guarantees cleanup even if aclose() is not called (edge case)
         #   - Makes the cleanup path visible in the code
         #   - Cleans up AsyncLLMEngine internal mappings
-        if engine_request_id is not None:
-            _engine.abort(engine_request_id)
+        #
+        # Use engine_request_id if captured from output, otherwise fall back to the
+        # engine's _current_request_id (set in generate() before first yield).
+        # This handles client disconnect before any RequestOutput is generated.
+        abort_id = engine_request_id if engine_request_id is not None else _engine._current_request_id
+        if abort_id is not None:
+            _engine.abort(abort_id)
         pass

@@ -794,7 +794,8 @@ class AsyncLLMEngine:
 
         # (1) Lazy startup of background loop
         # Create background Task only on first generate() call.
-        # Create new Task if previous one is done (e.g., after stop()).
+        # Create new Task if previous one is done (e.g., after stop()),
+        # OR if the previous Task was created on a different event loop.
         #
         # Why not start in __init__?
         #   - Engine may only be used for offline inference (via LLMEngine.generate() sync interface),
@@ -808,7 +809,20 @@ class AsyncLLMEngine:
         # Why use asyncio.ensure_future()?
         #   - ensure_future() wraps coroutine as Task and schedules it immediately
         #   - Equivalent to create_task() (Python 3.7+), but ensure_future is more general
-        if self._engine_task is None or self._engine_task.done():
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        needs_recreate = (
+            self._engine_task is None
+            or self._engine_task.done()
+            or (
+                current_loop is not None
+                and self._engine_task.get_loop() is not current_loop
+            )
+        )
+        if needs_recreate:
             self._stop_event = asyncio.Event()
             # Recreate RequestTracker to bind its asyncio primitives
             # (new_requests_event, queues) to the current event loop.

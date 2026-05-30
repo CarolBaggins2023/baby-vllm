@@ -9,7 +9,13 @@ dependencies = [
     "torch",
     "xxhash",
     "flash-attn",
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic",
 ]
+
+[project.scripts]
+babyvllm-server = "babyvllm.entrypoints.cli:main"
 
 [project.optional-dependencies]
 dev = [
@@ -22,11 +28,9 @@ dev = [
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-package-dir = {"" = "babyvllm"}
-
 [tool.setuptools.packages.find]
-where = ["babyvllm"]
+where = ["."]
+include = ["babyvllm*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

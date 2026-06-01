@@ -77,6 +77,8 @@ Architecture Overview (Data Flow + Control Flow)
 
 """
 
+from __future__ import annotations
+
 import asyncio
 import itertools
 import time

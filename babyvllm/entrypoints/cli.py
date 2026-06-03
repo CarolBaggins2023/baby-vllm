@@ -156,7 +156,7 @@ Examples:
              "Maps to Config.enforce_eager.",
     )
 
-    # ---- KV Cache Configuration (CR-5) ----
+    # ---- KV Cache Configuration ----
 
     parser.add_argument(
         "--kvcache-block-size", type=int, default=256,
@@ -243,22 +243,16 @@ def main():
         Model loaded successfully.
         Starting server on 127.0.0.1:8000...
     """
-    # =====================================================================
-    # Phase 1: Argument Parsing
-    # =====================================================================
+    # Parse command-line arguments.
 
     parser = create_parser()
     args = parser.parse_args()
 
-    # =====================================================================
-    # Phase 2: Build Engine Keyword Arguments
-    # =====================================================================
+    # Build engine keyword arguments.
 
     engine_kwargs = build_engine_kwargs(args)
 
-    # =====================================================================
-    # Phase 3: Late Imports and Engine Creation
-    # =====================================================================
+    # Late imports and engine creation.
 
     print(f"Loading model from {args.model}...")
 
@@ -279,9 +273,7 @@ def main():
     engine = AsyncLLMEngine(model=args.model, **engine_kwargs)
     print("Model loaded successfully.")
 
-    # =====================================================================
-    # Phase 4: Inject Engine into API Server Module
-    # =====================================================================
+    # Inject engine into API server module.
     #
     # Module-level singleton pattern:
     #   api_server._engine is accessed by all endpoint handlers.
@@ -298,9 +290,7 @@ def main():
 
     api_server._engine = engine
 
-    # =====================================================================
-    # Phase 5: Start HTTP Server
-    # =====================================================================
+    # Start HTTP server.
     #
     # uvicorn.run() is a blocking call:
     #   - Starts the asyncio event loop

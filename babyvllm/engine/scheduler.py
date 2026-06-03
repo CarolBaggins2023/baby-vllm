@@ -263,13 +263,13 @@ class Scheduler:
         
         Why use `seq.num_tokens` instead of `seq.num_prompt_tokens` in many judgements?
         Suppose the initial prompt length sent by the user is 100.
-        [Phase 1: Normal Chunked Prefill (e.g., chunk by 60)]
+        Normal chunked prefill (e.g., chunk by 60):
         - Step 1: num_computed_tokens=0,  num_tokens=100 -> need 100 more -> compute 60 tokens
         - Step 2: num_computed_tokens=60, num_tokens=100 -> need 40 more  -> compute 40 tokens, then output token 101 and append
-        [Phase 2: Normal Decode]
+        Normal decode:
         - Step 3: num_computed_tokens=100, num_tokens=101 -> need 1 more   -> Decode operator, output token 102 and append
         - Step 4: num_computed_tokens=101, num_tokens=102 -> need 1 more   -> Decode operator, output token 103 and append
-        [Phase 3: Critical Preemption Recovery]
+        Preemption recovery:
         - Assume after computing token 103, it gets preempted due to memory pressure.
         - During recovery, its KV cache is cleared and num_computed_tokens is reset to 0.
         - Current state: num_computed_tokens=0, num_tokens=103.

@@ -6,12 +6,15 @@ from dataclasses import dataclass
 class Context:
     is_prefill: bool = False
 
-    # `cu_seqlens_q` is the cumulative sequence lengths, considering both cached and uncached tokens.
-    # For example, suppose there are 3 sequences, with length 2, 3, and 5:
-    # Sequence 0: [token 0, token 1]
-    # Sequence 1: [token 2, token 3, token 4]
-    # Sequence 2: [token 5, token 6, token 7, token 8, token 9]
-    # Then `cu_seqlens_q` will be [0, 2, 5, 10],
+    # `cu_seqlens_q` is the cumulative length of query tokens in the current
+    # physical forward. For prefill/chunked prefill, each sequence contributes
+    # its scheduled chunk_size. For decode, q metadata is unused by
+    # flash_attn_with_kvcache.
+    # For example, if 3 sequences contribute current chunks of length 2, 3, and 5:
+    # Sequence 0 query tokens: [token 0, token 1]
+    # Sequence 1 query tokens: [token 2, token 3, token 4]
+    # Sequence 2 query tokens: [token 5, token 6, token 7, token 8, token 9]
+    # Then `cu_seqlens_q` is [0, 2, 5, 10],
     # where `cu_seqlens_q[0]` denotes the begin index of Sequence 0,
     # `cu_seqlens_q[1]` denotes the end index of Sequence 0 and the begin index of Sequence 1,
     # `cu_seqlens_q[2]` denotes the end index of Sequence 1 and the begin index of Sequence 2,
@@ -20,20 +23,23 @@ class Context:
     # (1) The begin index of each sequence: `cu_seqlens_q[:-1]`
     # (2) The end index of each sequence: `cu_seqlens_q[1:]`
     cu_seqlens_q: torch.Tensor|None = None
-    # `max_seqlen_q` is the maximum sequence length, considering both cached and uncached tokens.
+    # `max_seqlen_q` is the maximum current query chunk length.
     # For example, in the above example, the longest sequence is Sequence 2, with length 5,
     # so `max_seqlen_q` is 5.
     max_seqlen_q: int = 0
-    # `cu_seqlens_k` is the cumulative sequence lengths, considering only uncached tokens.
-    # It has the same data structure as `cu_seqlens_q`.
-    # In above example, suppose token 2 in Sequence 1 is cached, and token 5 and token 6 in Sequence 2 are cached,
-    # then `cu_seqlens_k` will be [0, 2, 4, 7].
+    # `cu_seqlens_k` is the cumulative visible context length for each
+    # sequence in the current forward: previous cached tokens plus the current
+    # chunk. It has the same prefix-sum structure as `cu_seqlens_q`.
+    # In the above example, if Sequence 1 has 1 previous token and Sequence 2
+    # has 2 previous tokens, then k lengths are [2, 4, 7] and
+    # `cu_seqlens_k` is [0, 2, 6, 13].
     cu_seqlens_k: torch.Tensor|None = None
-    # `max_seqlen_k` is the maximum sequence length, considering only uncached tokens.
+    # `max_seqlen_k` is the maximum visible context length.
     max_seqlen_k: int = 0
 
-    # `slot_mapping` maps token index to slot index in cache block. sequence <-> cache block
-    # `block_tables` maps sequence index to cache block indexs. token <-> slot in cache block
+    # `slot_mapping` maps each current input token to an absolute KV-cache slot.
+    # `block_tables` maps each sequence to the physical KV-cache blocks that
+    # store its history.
 
     # 1-dimension tensor, with shape of (num_tokens,).
     # It maps token index to cache slot index and maps padded token to -1.
@@ -43,38 +49,28 @@ class Context:
     slot_mapping: torch.Tensor|None = None
 
     # 2-dimension tensor, with shape of (num_sequences, num_blocks_per_sequence).
-    # It maps sequence index to cache block indexs.
+    # It maps sequence index to cache block indexes.
     # For examples, if Sequence 0 use Cache Block 0 and Cache Block 1, Sequence 1 use Cache Block 2,
     # then `block_tables` should be [[0, 1], [2]].
     block_tables: torch.Tensor|None = None
 
     # 1-dimension tensor, with shape of (num_sequences,).
-    # It records the number of handled tokens (prompt length in prefill,
-    # or generated length in decode) in each sequence.
-    # For example, if Sequence 0 has 5 tokens in prompt, Sequence 1 has 3 tokens in prompt,
-    # then the `context_lens` is [5, 3] after prefilling.
-    # After prefilling and before first decoding, `context_lens` is still [5, 3].
-    # After first deocoding and before second decoding, `context_lens` becomes [6, 4].
+    # It records the visible context length for each sequence after the current
+    # chunk has been written to KV cache. This is prompt tokens plus generated
+    # tokens, not just the number of completion tokens.
+    # For example, if Sequence 0 has 5 prompt tokens and Sequence 1 has 3 prompt
+    # tokens, then `context_lens` is [5, 3] after prefilling.
+    # After the first decode token for each sequence, `context_lens` becomes [6, 4].
     context_lens: torch.Tensor|None = None
     
 # ---------------------------------------------------------------------------
-#  To implement online service:
-#    Replace module-level global mutable singleton with contextvars.ContextVar.
+# Attention metadata is stored in a ContextVar rather than a module-level
+# mutable singleton. Each asyncio Task gets an isolated Context, so concurrent
+# requests cannot overwrite each other's cu_seqlens, block tables, slot mapping,
+# or KV-cache metadata.
 #
-#  Problem Background (before refactoring):
-#    The old code used a module-level global variable `_CONTEXT = Context()` to
-#    store attention metadata. Each call to set_context() directly overwrites
-#    this global object. When multiple requests execute concurrently, different
-#    model forward passes overwrite each other's attention metadata.
-#    It leads to:
-#      - cu_seqlens / block_tables / slot_mapping corruption
-#      - KV cache written to wrong locations, producing random outputs or even
-#        CUDA illegal memory access
-#
-#  Solution:
-#    Python 3.7+'s built-in contextvars module provides "context variables"
-#    (ContextVar), where each asyncio Task has its own independent copy of the
-#    variable.
+#  Why ContextVar:
+#    Python 3.7+'s built-in contextvars module provides task-local values.
 #
 #  How it works:
 #      ┌──────────────────────────────────────────────────────┐
@@ -101,10 +97,9 @@ class Context:
 #    ContextVar is a pure C-implemented thread/coroutine local storage with
 #    negligible overhead.
 # ---------------------------------------------------------------------------
-# ContextVar itself is a module-level shared "key", but each Task uses this key
-# to open its own "locker". default=Context() ensures that in environments where
-# set() has not been called explicitly (e.g., single-threaded offline inference),
-# get() returns a clean default Context, behaving exactly as before refactoring.
+# ContextVar itself is a module-level shared "key", but each Task gets its own
+# value. default=Context() keeps single-threaded/offline inference working even
+# when set_context() has not been called explicitly.
 _context_var: contextvars.ContextVar[Context] = contextvars.ContextVar(
     'context', default=Context()
 )

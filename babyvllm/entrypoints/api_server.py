@@ -61,7 +61,7 @@ import asyncio  # For asyncio.CancelledError handling in streaming
 import json     # For model_dump_json() on Pydantic models
 import os       # For path basename in _get_model_name()
 import time     # For created Unix timestamps in responses
-import uuid     # For generating request IDs (CR-3)
+import uuid     # For generating API request IDs
 from contextlib import asynccontextmanager  # For FastAPI lifespan context manager
 from typing import (  # Type annotations for function signatures
     Any,
@@ -72,7 +72,7 @@ from typing import (  # Type annotations for function signatures
 
 # FastAPI framework imports
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware  # CORS support (MI-3)
+from fastapi.middleware.cors import CORSMiddleware  # CORS support
 from fastapi.responses import Response, StreamingResponse  # HTTP response types
 
 # Pydantic v2 imports for request/response validation
@@ -160,7 +160,7 @@ def _get_model_name() -> str:
 
 def _random_id(prefix: str = "cmpl") -> str:
     """
-    Generate a UUID-based request ID string for API responses (CR-3).
+    Generate a UUID-based request ID string for API responses.
 
     Why not use engine's internal int request_id?
       - OpenAI API expects string IDs like "cmpl-{uuid}" or "chatcmpl-{uuid}"
@@ -206,7 +206,7 @@ def _normalize_prompt(prompt: Union[str, list[int]]) -> Union[str, list[int]]:
 
 def _clamp_temperature(temp: Optional[float]) -> float:
     """
-    Clamp temperature to avoid SamplingParams assertion failure (CR-1).
+    Clamp temperature to avoid SamplingParams assertion failure.
 
     Problem:
       SamplingParams.__post_init__ asserts: assert self.temperature > 1e-10
@@ -218,9 +218,8 @@ def _clamp_temperature(temp: Optional[float]) -> float:
       This is effectively greedy sampling but avoids the assertion.
 
     Why not modify SamplingParams itself?
-      SamplingParams is Phase 1 code. The API layer handles the compatibility
-      mapping. This follows the Adapter pattern — the API layer adapts between
-      OpenAI's spec and baby-vllm's internal constraints.
+      The API layer owns OpenAI compatibility mapping, while SamplingParams
+      remains the internal engine contract. This keeps the boundary explicit.
 
     Args:
         temp: Temperature value from the client request (None defaults to 1.0).
@@ -275,7 +274,7 @@ class OpenAIBaseModel(BaseModel):
 
 class UsageInfo(BaseModel):
     """
-    OpenAI-compatible token usage statistics (CR-4).
+    OpenAI-compatible token usage statistics.
 
     Computed in the API layer from RequestOutput fields:
       - prompt_tokens = len(output.prompt_token_ids)
@@ -305,15 +304,14 @@ class MetricsInfo(BaseModel):
     Populated from RequestOutput fields when a request completes (finished=True).
     These are collected by AsyncLLMEngine and passed through to the API response.
 
-    In the current engine (which only reports completed sequences), TTFT is
-    approximated as the end-to-end latency. These metrics will become precise
-    when per-step incremental output is supported in the engine.
+    TTFT is measured when the first non-empty token delta is routed. TPOT and
+    total_time are populated when the final output is routed.
     """
     ttft: Optional[float] = None
-    """Time to first token in seconds (approximate in current engine)."""
+    """Time to first token in seconds."""
 
     tpot: Optional[float] = None
-    """Time per output token in seconds (approximate in current engine)."""
+    """Time per output token in seconds."""
 
     total_time: Optional[float] = None
     """Total inference time in seconds for this request."""
@@ -330,12 +328,12 @@ class CompletionRequest(OpenAIBaseModel):
 
     Field Mapping to baby-vllm:
       prompt         → AsyncLLMEngine.generate(prompt=...)
-      temperature    → SamplingParams(temperature=...), clamped to >= 1e-6 (CR-1)
+      temperature    → SamplingParams(temperature=...), clamped to >= 1e-6
       max_tokens     → SamplingParams(max_tokens=...), default 16
       ignore_eos     → SamplingParams(ignore_eos=...)
       stream         → Controls StreamingResponse vs JSONResponse
       echo           → Prepends prompt text to completion (API layer)
-      stop           → Accepted but NOT enforced in Phase 4
+      stop           → Accepted for compatibility, not enforced by the engine
       n              → Only n=1 is supported (single completion per request)
 
     Why default max_tokens=16 instead of SamplingParams default of 64?
@@ -376,7 +374,7 @@ class CompletionRequest(OpenAIBaseModel):
     temperature: Optional[float] = 1.0
     """
     Sampling temperature (0.0 to 2.0 in OpenAI spec).
-    CLAMPED to minimum 1e-6 before constructing SamplingParams (CR-1).
+    Clamped to minimum 1e-6 before constructing SamplingParams.
     Default 1.0 matches OpenAI API.
     """
 
@@ -390,8 +388,7 @@ class CompletionRequest(OpenAIBaseModel):
     stop: Optional[Union[str, list[str]]] = None
     """
     Stop sequences that terminate generation early.
-    ACCEPTED but NOT enforced in Phase 4. Included for API compatibility.
-    Will be implemented in a future phase.
+    Accepted for API compatibility, but not enforced by the current engine.
     """
 
     echo: Optional[bool] = False
@@ -410,7 +407,7 @@ class CompletionRequest(OpenAIBaseModel):
     n: int = 1
     """
     Number of completions to generate per prompt.
-    Only n=1 is supported in Phase 4. Values > 1 will raise a validation error.
+    Only n=1 is supported. Values > 1 raise a validation error.
     Maps to single engine.generate() call.
     """
 
@@ -431,7 +428,7 @@ class CompletionRequest(OpenAIBaseModel):
     @classmethod
     def validate_prompt(cls, v):
         """
-        Validate the prompt field — only accept str and list[int] (CR-2).
+        Validate the prompt field — only accept str and list[int].
 
         What is rejected:
           - list[str]: e.g., ["prompt1", "prompt2"] — batch of string prompts
@@ -458,8 +455,8 @@ class CompletionRequest(OpenAIBaseModel):
             ValueError: If prompt is a list containing non-integers.
         """
         if isinstance(v, list):
-            # Review fix: Check for empty list (vacuous truth in all() check below).
-            # Empty prompt would create a zero-token sequence, producing confusing output.
+            # Check for empty list before all(); all([]) is vacuously true.
+            # Empty prompts would create zero-token sequences.
             if len(v) == 0:
                 raise ValueError(
                     "prompt list must not be empty. "
@@ -519,20 +516,20 @@ class CompletionResponseChoice(BaseModel):
     """Index of this choice in the choices array. Always 0 (single completion)."""
 
     text: str = ""
-    """The generated text (or full text with echo). Set to empty string during prefill."""
+    """The generated text delta, or full text when echo is applied."""
 
     finish_reason: Optional[str] = None
     """
     Reason for completion termination.
-    Values: "stop" (EOS token generated), "length" (max_tokens reached).
-    None during streaming (incomplete chunks).
-    In Phase 4: always "stop" when finished (engine only outputs completed sequences).
+    The current API layer reports "stop" for any completed request and does
+    not distinguish EOS, max_tokens, or max_model_length termination.
+    None during streaming chunks that are not final.
     """
 
     logprobs: Optional[Any] = None
     """
     Log probabilities for generated tokens.
-    Always None in Phase 4 (logprob computation not yet implemented).
+    Always None because logprob computation is not implemented.
     Included for API compatibility with OpenAI SDK.
     """
 
@@ -553,7 +550,7 @@ class CompletionResponse(OpenAIBaseModel):
       }
     """
     id: str
-    """Unique request ID, e.g., "cmpl-a1b2c3d4". Generated by _random_id() (CR-3)."""
+    """Unique request ID, e.g., "cmpl-a1b2c3d4". Generated by _random_id()."""
 
     object: str = "text_completion"
     """Object type identifier per OpenAI API spec. Always "text_completion"."""
@@ -565,10 +562,10 @@ class CompletionResponse(OpenAIBaseModel):
     """Model identifier, e.g., "Qwen2-0.5B-Instruct". From _get_model_name()."""
 
     choices: list[CompletionResponseChoice]
-    """Array of completion choices. In Phase 4, always a single-element list."""
+    """Array of completion choices. baby-vllm currently returns one choice."""
 
     usage: UsageInfo
-    """Token usage statistics computed from RequestOutput (CR-4)."""
+    """Token usage statistics computed from RequestOutput."""
 
     metrics: Optional[MetricsInfo] = None
     """Per-request performance timing metrics (baby-vllm extension)."""
@@ -644,7 +641,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         1. Chat Template (preferred): Uses tokenizer.apply_chat_template() with
            the model's built-in Jinja2 chat template. This adds special tokens
            like <|im_start|>user\n...<|im_end|> per the model's training format.
-        2. Fallback (MI-5): For tokenizers without chat_template, concatenates
+        2. Fallback: For tokenizers without chat_template, concatenates
            messages as "{role}: {content}\n" and appends "assistant: " if
            add_generation_prompt is True.
 
@@ -671,13 +668,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
     """Maximum tokens to generate. Default 16 matches OpenAI API."""
 
     temperature: Optional[float] = 1.0
-    """Sampling temperature. Clamped to >= 1e-6 (CR-1)."""
+    """Sampling temperature. Clamped to >= 1e-6 before SamplingParams."""
 
     stream: Optional[bool] = False
     """Whether to stream results as SSE."""
 
     stop: Optional[Union[str, list[str]]] = None
-    """Stop sequences. Accepted but not enforced in Phase 4."""
+    """Stop sequences. Accepted for compatibility but not enforced."""
 
     ignore_eos: bool = False
     """Whether to ignore the EOS token."""
@@ -741,7 +738,7 @@ class ChatCompletionResponseChoice(BaseModel):
     """The generated assistant message."""
 
     finish_reason: Optional[str] = None
-    """Reason for termination: "stop", "length", or None (if streaming)."""
+    """Reason for termination. Current API responses use "stop" when final."""
 
 
 class ChatCompletionResponse(OpenAIBaseModel):
@@ -960,7 +957,7 @@ app = FastAPI(
 
 
 # ===========================================================================
-# CORS Middleware (MI-3)
+# CORS Middleware
 # ===========================================================================
 #
 # Why allow all origins?
@@ -980,7 +977,7 @@ app.add_middleware(
 
 
 # ===========================================================================
-# Error Handlers (MI-4) — OpenAI-compatible error format
+# Error Handlers — OpenAI-compatible error format
 # ===========================================================================
 
 
@@ -1004,8 +1001,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
       expecting this structure. Using a different format would break error
       handling in client code.
 
-    The 'param' and additional fields are omitted for simplicity but can
-    be added in future phases.
+    The 'param' and additional fields are omitted for simplicity.
     """
     return Response(
         status_code=exc.status_code,
@@ -1067,7 +1063,7 @@ async def health():
         $ curl http://localhost:8000/health
         (HTTP 200, empty body)
     """
-    # Review fix: Check engine is initialized, not just FastAPI accepting connections.
+    # Check engine is initialized, not just FastAPI accepting connections.
     # Without this, a health check could pass while the model is still loading.
     if _engine is None:
         return Response(status_code=503)
@@ -1142,17 +1138,16 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     Processing Pipeline:
       1. Validate request via Pydantic (already done by FastAPI)
       2. Normalize prompt → pass through (validation already done)
-      3. Clamp temperature → prevent SamplingParams assertion error (CR-1)
+      3. Clamp temperature → prevent SamplingParams assertion error
       4. Build SamplingParams from request fields
-      5. Generate string request_id (CR-3)
+      5. Generate string request_id
       6. Choose streaming or non-streaming code path
       7. For streaming: return StreamingResponse wrapping SSE async generator
       8. For non-streaming: collect all outputs, return final JSON
 
     Args:
         request: Validated CompletionRequest from request body.
-        raw_request: Raw FastAPI Request object. Accepted for future use
-                     (e.g., client disconnect detection). Currently unused.
+        raw_request: Raw FastAPI Request object. Currently unused by this handler.
 
     Returns:
         CompletionResponse JSON (non-streaming) or
@@ -1178,7 +1173,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     # (1) Normalize prompt — currently pass-through, Pydantic already validated format
     prompt = _normalize_prompt(request.prompt)
 
-    # (2) Clamp temperature — CR-1: avoid SamplingParams assertion for temperature=0
+    # (2) Clamp temperature to avoid SamplingParams assertion for temperature=0
     temperature = _clamp_temperature(request.temperature)
 
     # (3) Build SamplingParams from request
@@ -1194,7 +1189,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     # (4) Get model name for response headers
     model_name = _get_model_name()
 
-    # (5) Generate API-layer string request_id (CR-3)
+    # (5) Generate API-layer string request_id
     #     NOT using engine's internal int ID — we generate our own UUID-based string
     request_id = _random_id("cmpl")
 
@@ -1233,19 +1228,19 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         1. Chat Template: Uses tokenizer.apply_chat_template() with the model's
            built-in Jinja2 template. Adds special tokens per model format.
            Example: <|im_start|>system\nYou are helpful.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n
-        2. Fallback (MI-5): Simple format for tokenizers without chat_template:
+        2. Fallback: Simple format for tokenizers without chat_template:
            "system: You are helpful.\nuser: Hi\nassistant: "
 
     Processing Pipeline:
       1. Convert chat messages → token IDs (via chat template or fallback)
-      2. Clamp temperature (CR-1)
+      2. Clamp temperature
       3. Build SamplingParams
-      4. Generate string request_id (CR-3)
+      4. Generate string request_id
       5. Route to streaming or non-streaming handler
 
     Args:
         request: Validated ChatCompletionRequest from request body.
-        raw_request: Raw FastAPI Request object (for future disconnect detection).
+        raw_request: Raw FastAPI Request object. Currently unused by this handler.
 
     Returns:
         ChatCompletionResponse JSON (non-streaming) or
@@ -1278,7 +1273,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     #      tokenize=True → returns list[int] (token IDs), not str
     #      add_generation_prompt → appends the assistant turn marker
     #
-    # (1b) Fallback (MI-5): Tokenizers without chat_template (e.g., older models)
+    # (1b) Fallback: Tokenizers without chat_template (e.g., older models)
     #      Concatenate messages as "{role}: {content}" lines
     #      Append "assistant: " if add_generation_prompt=True
     if hasattr(_engine.tokenizer, "chat_template") and _engine.tokenizer.chat_template:
@@ -1294,7 +1289,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             if hasattr(prompt_token_ids, "tolist"):  # torch.Tensor / numpy array
                 prompt_token_ids = prompt_token_ids.tolist()
     else:
-        # MI-5: Fallback for tokenizers without chat_template
+        # Fallback for tokenizers without chat_template.
         fallback_text = "\n".join(
             f"{m['role']}: {m['content']}" for m in messages
         )
@@ -1302,7 +1297,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             fallback_text += "\nassistant: "
         prompt_token_ids = _engine.tokenizer.encode(fallback_text)
 
-    # (2) Clamp temperature (CR-1)
+    # (2) Clamp temperature
     temperature = _clamp_temperature(request.temperature)
 
     # (3) Build SamplingParams
@@ -1338,12 +1333,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 # These functions collect ALL RequestOutput from the async generator and
 # return a single Pydantic model for JSON serialization.
 #
-# Why collect all outputs instead of just the first/last?
-#   In the current engine implementation, engine.step() only produces output
-#   when a sequence is FINISHED. So each request typically has exactly 1 output.
-#   However, future incremental streaming optimizations may produce multiple
-#   outputs per request (e.g., per-token decoding). Collecting all and using
-#   the last ensures correctness regardless of engine behavior.
+# Why collect all outputs instead of just the last?
+#   The engine may yield multiple token deltas before the final chunk. Collecting
+#   every output lets non-streaming responses join the full generated text while
+#   still using the final output for finish state and timing metrics.
 # ===========================================================================
 
 
@@ -1364,7 +1357,7 @@ async def _non_stream_completion(
         prompt: Raw prompt (str or list[int]).
         sampling_params: Sampling parameters.
         model_name: Model name for the response "model" field.
-        request_id: API-layer string request ID (CR-3).
+        request_id: API-layer string request ID.
         echo: Whether to prepend the prompt to the generated text.
 
     Returns:
@@ -1378,9 +1371,7 @@ async def _non_stream_completion(
     completion_text_parts: list[str] = []
     completion_token_ids: list[int] = []
 
-    # Consume all outputs from the async generator.
-    # In current engine, only 1 output per request (when finished).
-    # The for-loop pattern future-proofs for incremental decoding.
+    # Consume all token deltas from the async generator.
     try:
         async for output in _engine.generate(prompt, sampling_params):
             if engine_request_id is None:
@@ -1424,7 +1415,7 @@ async def _non_stream_completion(
         finish_reason="stop" if final_output.finished else None,
     )
 
-    # CR-4: Compute usage info from token ID arrays
+    # Compute usage info from token ID arrays.
     # prompt_tokens = number of input tokens
     # completion_tokens = number of generated tokens (new tokens only)
     usage = UsageInfo(
@@ -1443,7 +1434,7 @@ async def _non_stream_completion(
             total_time=final_output.total_time,
         )
 
-    # MI-1: Return Pydantic model directly — FastAPI handles JSON serialization
+    # Return Pydantic model directly; FastAPI handles JSON serialization.
     return CompletionResponse(
         id=request_id,
         created=int(time.time()),
@@ -1513,7 +1504,7 @@ async def _non_stream_chat_completion(
         finish_reason="stop" if final_output.finished else None,
     )
 
-    # CR-4: Compute usage info
+    # Compute usage info.
     usage = UsageInfo(
         prompt_tokens=len(final_output.prompt_token_ids),
         completion_tokens=len(completion_token_ids),
@@ -1529,7 +1520,7 @@ async def _non_stream_chat_completion(
             total_time=final_output.total_time,
         )
 
-    # MI-1: Return Pydantic model directly
+    # Return Pydantic model directly.
     return ChatCompletionResponse(
         id=request_id,
         created=int(time.time()),
@@ -1585,7 +1576,7 @@ async def _stream_completion(
         model_name: Model name for each chunk.
         request_id: API-layer string request ID.
         echo: Whether to include prompt text in the output.
-        raw_request: FastAPI Request object (for future disconnect detection).
+        raw_request: FastAPI Request object. Currently unused by this generator.
 
     Yields:
         str: SSE-formatted data lines.
@@ -1765,7 +1756,7 @@ async def _stream_chat_completion(
                 metrics=metrics,
             )
 
-            # exclude_none=True (Review fix): OpenAI omits null fields from
+            # exclude_none=True omits null fields from
             # chat streaming chunks. Without this, intermediate chunks would
             # serialize {"usage": null, "delta": {"role": null, "content": "..."}}.
             # We need exclude_none to omit role=null in non-first chunks

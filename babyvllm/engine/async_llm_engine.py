@@ -258,7 +258,7 @@ class AsyncLLMEngine:
         return self._engine_task is not None and not self._engine_task.done()
 
     # =========================================================================
-    # Phase 1: Request Registration (API Layer -> RequestTracker)
+    # Request Registration (API Layer -> RequestTracker)
     # =========================================================================
 
     def add_request(
@@ -270,17 +270,17 @@ class AsyncLLMEngine:
         """
         Register a new inference request (synchronous method, called by API layer / generate()).
 
-        This is the first phase of "two-phase request registration" - only registration, no Sequence creation:
+        This method only registers the request; Sequence creation is deferred:
           1. Tokenize (if string prompt provided)
           2. Generate unique request_id (using own _request_counter)
           3. Store prompt_token_ids in _prompt_map
           4. Call tracker.add_request() to enqueue request into _new_requests
           5. Return (AsyncStream, request_id)
 
-        Second phase in _engine_step():
-            drain queue from tracker -> create Sequence -> add to scheduler.
+        _engine_step() later drains the tracker queue, creates the Sequence, and
+        adds it to the scheduler.
 
-        Why delay all scheduler operations to second phase?
+        Why delay scheduler operations?
           LLMEngine.scheduler is not thread-safe.
           Centralizing all scheduler operations in engine loop can avoid coroutine race conditions.
 
@@ -371,19 +371,19 @@ class AsyncLLMEngine:
         return stream, request_id
 
     # =========================================================================
-    # Phase 2: Request Landing (RequestTracker → Scheduler)
+    # Request Landing (RequestTracker → Scheduler)
     # =========================================================================
 
     def _add_request_to_engine(self, request_data: dict) -> None:
         """
         Transfer a new request from tracker to engine scheduler.
 
-        This is the second phase of "two-phase request registration" - all scheduler changes are centralized here:
+        All scheduler changes for newly registered requests are centralized here:
           1. Extract prompt_token_ids and sampling_params from request_data
           2. Create Sequence object (internally gets unique seq_id from Sequence.counter)
           3. Add Sequence to Scheduler's waiting queue
           4. Build seq_id → request_id mapping (_seq_to_request)
-            Note: _prompt_map already built in add_request() phase, no need to rebuild here
+            Note: _prompt_map was already built in add_request(), no need to rebuild here
 
         Role of RequestTracker._new_requests:
           asyncio.Queue acts as bridge between API layer (asyncio coroutines) and engine loop:
@@ -432,7 +432,7 @@ class AsyncLLMEngine:
         self._request_to_seq[request_id] = seq.seq_id
 
     # =========================================================================
-    # Phase 3: Single Engine Iteration
+    # Single Engine Iteration
     # =========================================================================
 
     def _route_engine_outputs(
@@ -513,8 +513,7 @@ class AsyncLLMEngine:
         Execute one complete inference step of the engine.
 
         Full cycle: abort processing → new request admission → scheduling →
-        GPU execution → result routing. Updated for Phase 5 with error handling
-        and abort support.
+        GPU execution → result routing, with error handling and abort support.
 
         Execution Order:
           1. Drain aborted requests + new requests from RequestTracker
@@ -659,7 +658,7 @@ class AsyncLLMEngine:
         return True
 
     # =========================================================================
-    # Phase 4: Background Engine Main Loop
+    # Background Engine Main Loop
     # =========================================================================
 
     async def _run_engine_loop(self):
@@ -743,7 +742,7 @@ class AsyncLLMEngine:
                 await asyncio.sleep(0)
 
     # =========================================================================
-    # Phase 5: External API — Streaming Generation
+    # External API — Streaming Generation
     # =========================================================================
 
     async def generate(
@@ -756,8 +755,8 @@ class AsyncLLMEngine:
         Async generator — main entry point for API layer.
 
         Each generate() call corresponds to an independent inference request.
-        Caller consumes RequestOutput one by one via async for (in current baby-vllm implementation,
-        each request typically yields once since engine.step() only outputs when sequence completes).
+        Caller consumes RequestOutput deltas one by one via async for until the
+        final output has finished=True.
 
         Internal Flow:
           1. Lazily start background engine loop (if not started yet)
@@ -784,8 +783,8 @@ class AsyncLLMEngine:
 
 
         Yields:
-            RequestOutput: Output object containing request_id, text, token_ids, finished=True,
-                           prompt_token_ids.
+            RequestOutput: Output object containing request_id, text, token_ids,
+                           finished, and prompt_token_ids.
 
         Raises:
             ValueError: prompt type is not str or list[int].
@@ -890,15 +889,12 @@ class AsyncLLMEngine:
         # (4) Async consume stream and yield one by one
         # stream.generator() returns _AsyncStreamIter object.
         #
-        # Note: In current implementation, engine.step() only produces output when sequence completes,
-        # so each request typically has only 1 RequestOutput.
-        # Using async for loop (instead of awaiting single value) reserves compatibility
-        # for future incremental output support (yield per token).
+        # The stream may yield multiple token deltas before the final output.
         async for output in stream.generator():
             yield output
 
     # =========================================================================
-    # Phase 6: Request Cancellation
+    # Request Cancellation
     # =========================================================================
 
     def abort(self, request_id: int) -> None:

@@ -60,7 +60,7 @@ class AsyncStream:
     The API layer consumes it asynchronously via generator() for streaming output.
 
     Attributes:
-        request_id: The associated request ID (equals Sequence.seq_id).
+        request_id: The engine-level request ID used by AsyncLLMEngine routing.
 
     Lifecycle:
         ┌─────────┐   put()    ┌──────────┐   put()    ┌─────────┐
@@ -319,7 +319,7 @@ class RequestTracker:
 
         Args:
             request_id: Unique request ID. Caller is responsible for ensuring global uniqueness
-                        (typically auto-generated using Sequence.counter).
+                        (AsyncLLMEngine uses its own request counter).
             prompt_token_ids: List of token IDs for the prompt.
                               Later used to populate prompt_token_ids field when creating RequestOutput.
             sampling_params: Sampling parameters (used by AsyncLLMEngine).
@@ -571,7 +571,7 @@ class RequestTracker:
                     request_id=seq_id,
                     text=tokenizer.decode(token_ids),
                     token_ids=token_ids,
-                    finished=True, # Current engine.step() only returns completed sequences
+                    finished=finished,
                     prompt_token_ids=prompt_map[seq_id],
                 ))
             tracker.process_step_outputs(request_outputs)

@@ -21,6 +21,7 @@ import argparse
 import asyncio
 import json
 import random
+import sys
 import time
 from dataclasses import dataclass
 from random import randint, seed as py_seed
@@ -48,6 +49,7 @@ class PerRequestMetrics:
     tpot: float = 0.0
     total_time: float = 0.0
     error_message: str = ""
+    request_type: str = "unknown"
 
 
 @dataclass
@@ -76,6 +78,47 @@ class AggregateMetrics:
     latency_p99: float = 0.0
     avg_gpu_memory_mb: float = 0.0
     avg_gpu_utilization: float = 0.0
+
+
+SCENARIO_PRESETS = {
+    "realistic-decode": {
+        "num_requests": 64,
+        "concurrency": 8,
+        "workload": "mixed",
+        "prompt_len_distribution": "bimodal",
+        "long_prompt_ratio": 0.6,
+        "short_input_len": 512,
+        "long_input_len": 1536,
+        "short_output_len": 2048,
+        "long_output_len": 4096,
+        "arrival_pattern": "poisson",
+        "rate_rps": 0.5,
+        "timeout": 900.0,
+        "max_model_len": 8192,
+        "max_num_batched_tokens": 16384,
+        "max_num_sequences": 64,
+        "max_prefill_tokens_per_step": 8192,
+        "max_prefill_chunk_size": 2048,
+    },
+}
+
+
+def apply_scenario_preset(
+    args: argparse.Namespace,
+    argv: Optional[list[str]] = None,
+) -> argparse.Namespace:
+    """Apply a scenario preset without clobbering explicit CLI overrides."""
+
+    argv = sys.argv[1:] if argv is None else argv
+    preset = SCENARIO_PRESETS.get(args.scenario, {})
+    provided_options = set(arg.split("=", 1)[0] for arg in argv if arg.startswith("--"))
+
+    for attr, value in preset.items():
+        option = "--" + attr.replace("_", "-")
+        if option not in provided_options:
+            setattr(args, attr, value)
+
+    return args
 
 
 # ===========================================================================
@@ -115,7 +158,69 @@ def generate_random_test_data(
         )
         for _ in range(num_requests)
     ]
-    return prompt_token_ids, sampling_params
+    return prompt_token_ids, sampling_params, ["random"] * num_requests
+
+
+def generate_mixed_test_data(
+    num_requests: int,
+    prompt_len_distribution: str,
+    short_input_len: int,
+    long_input_len: int,
+    short_output_len: int,
+    long_output_len: int,
+    long_prompt_ratio: float,
+    seed_val: int = 42,
+) -> tuple:
+    """Generate a realistic long-prompt-heavy online workload."""
+    from babyvllm import SamplingParams
+
+    rng = random.Random(seed_val)
+    short_input_len = max(short_input_len, 1)
+    long_input_len = max(long_input_len, short_input_len)
+    short_output_len = max(short_output_len, 1)
+    long_output_len = max(long_output_len, short_output_len)
+    long_prompt_ratio = min(max(long_prompt_ratio, 0.0), 1.0)
+
+    def sample_prompt_len() -> tuple[int, str]:
+        if prompt_len_distribution == "bimodal":
+            is_long = rng.random() < long_prompt_ratio
+            if is_long:
+                low = max(short_input_len + 1, int(long_input_len * 0.75))
+                return rng.randint(low, long_input_len), "long"
+            low = max(1, int(short_input_len * 0.5))
+            return rng.randint(low, short_input_len), "short"
+        if prompt_len_distribution == "uniform":
+            length = rng.randint(short_input_len, long_input_len)
+            split = short_input_len + (long_input_len-short_input_len) * 0.5
+            return length, "long" if length >= split else "short"
+        if prompt_len_distribution == "lognormal":
+            mu = (np.log(short_input_len) + np.log(long_input_len)) / 2
+            sigma = 1.0
+            length = int(rng.lognormvariate(mu, sigma))
+            length = max(short_input_len, min(length, long_input_len))
+            split = short_input_len + (long_input_len-short_input_len) * 0.5
+            return length, "long" if length >= split else "short"
+        raise ValueError(f"Unknown prompt length distribution: {prompt_len_distribution}")
+
+    prompt_token_ids = []
+    sampling_params = []
+    request_types = []
+
+    for _ in range(num_requests):
+        prompt_len, request_type = sample_prompt_len()
+        if request_type == "long":
+            max_tokens = rng.randint(max(1, long_output_len // 2), long_output_len)
+        else:
+            max_tokens = rng.randint(max(1, short_output_len // 2), short_output_len)
+        prompt_token_ids.append([rng.randint(0, 10000) for _ in range(prompt_len)])
+        sampling_params.append(SamplingParams(
+            temperature=0.6,
+            ignore_eos=True,
+            max_tokens=max_tokens,
+        ))
+        request_types.append(request_type)
+
+    return prompt_token_ids, sampling_params, request_types
 
 
 # ===========================================================================
@@ -174,6 +279,50 @@ def compute_aggregate_metrics(
     agg.avg_gpu_utilization = avg_gpu_utilization
 
     return agg
+
+
+def compute_request_type_breakdown(per_request_list: list) -> dict:
+    """Compute latency/token summaries by request type (short/long/random)."""
+    breakdown = {}
+    request_types = sorted({r.request_type for r in per_request_list})
+    for request_type in request_types:
+        group = [r for r in per_request_list if r.request_type == request_type]
+        successful = [r for r in group if r.status == "success"]
+        ttfts = [r.ttft for r in successful if r.ttft > 0]
+        tpots = [r.tpot for r in successful if r.tpot > 0]
+        latencies = [r.total_time for r in successful if r.total_time > 0]
+        prompt_tokens = [r.prompt_tokens for r in successful]
+        completion_tokens = [r.completion_tokens for r in successful]
+
+        def pct(values: list[float], q: int) -> float:
+            return float(np.percentile(values, q)) if values else 0.0
+
+        breakdown[request_type] = {
+            "num_requests": len(group),
+            "num_success": len(successful),
+            "num_failed": len(group) - len(successful),
+            "prompt_tokens_avg": float(np.mean(prompt_tokens)) if prompt_tokens else 0.0,
+            "completion_tokens_avg": float(np.mean(completion_tokens)) if completion_tokens else 0.0,
+            "ttft": {
+                "avg": float(np.mean(ttfts)) if ttfts else 0.0,
+                "p50": pct(ttfts, 50),
+                "p90": pct(ttfts, 90),
+                "p99": pct(ttfts, 99),
+            },
+            "tpot": {
+                "avg": float(np.mean(tpots)) if tpots else 0.0,
+                "p50": pct(tpots, 50),
+                "p90": pct(tpots, 90),
+                "p99": pct(tpots, 99),
+            },
+            "latency": {
+                "avg": float(np.mean(latencies)) if latencies else 0.0,
+                "p50": pct(latencies, 50),
+                "p90": pct(latencies, 90),
+                "p99": pct(latencies, 99),
+            },
+        }
+    return breakdown
 
 
 # ===========================================================================
@@ -238,6 +387,46 @@ def print_report(config: argparse.Namespace, agg: AggregateMetrics) -> None:
     print("=" * 66)
 
 
+def print_engine_stats(engine_stats: dict) -> None:
+    """Print lightweight engine instrumentation counters if available."""
+    if not engine_stats:
+        return
+
+    scheduler_stats = engine_stats.get("scheduler", {})
+    model_runner_stats = engine_stats.get("model_runner", {})
+
+    print("\n--- Engine Stats ---")
+    if scheduler_stats:
+        print(
+            " Scheduler batches: "
+            f"pure_decode={scheduler_stats.get('pure_decode', 0)} | "
+            f"pure_prefill={scheduler_stats.get('pure_prefill', 0)} | "
+            f"mixed={scheduler_stats.get('mixed', 0)} | "
+            f"preempt={scheduler_stats.get('preempt', 0)}"
+        )
+    if model_runner_stats:
+        print(
+            " Model runner: "
+            f"cuda_graph_replay={model_runner_stats.get('cuda_graph_replay', 0)} | "
+            f"eager={model_runner_stats.get('eager', 0)}"
+        )
+
+
+def print_request_type_breakdown(per_request_list: list) -> None:
+    breakdown = compute_request_type_breakdown(per_request_list)
+    if len(breakdown) <= 1:
+        return
+    print("\n--- By Request Type ---")
+    for request_type, stats in breakdown.items():
+        print(
+            f" {request_type:>6}: n={stats['num_success']:3d}/{stats['num_requests']:3d} | "
+            f"prompt_avg={stats['prompt_tokens_avg']:.1f} | "
+            f"ttft_p50={stats['ttft']['p50']:.4f}s | "
+            f"tpot_p50={stats['tpot']['p50']:.4f}s | "
+            f"lat_p90={stats['latency']['p90']:.4f}s"
+        )
+
+
 # ===========================================================================
 # JSON Export
 # ===========================================================================
@@ -247,17 +436,32 @@ def export_json(
     per_request_list: list,
     filepath: str,
     config: Optional[argparse.Namespace] = None,
+    engine_stats: Optional[dict] = None,
 ) -> None:
     """Export benchmark results to JSON file."""
     result = {
         "config": {
             "mode": config.mode if config else "unknown",
+            "scenario": getattr(config, "scenario", "realistic-decode"),
             "num_requests": agg.num_requests,
             "concurrency": getattr(config, "concurrency", 0),
             "stream": getattr(config, "stream", True),
-            "arrival_pattern": getattr(config, "arrival_pattern", "batch"),
+            "arrival_pattern": getattr(config, "arrival_pattern", "poisson"),
+            "rate_rps": getattr(config, "rate_rps", 0.0),
             "batch_size": getattr(config, "batch_size", 32),
             "batch_interval": getattr(config, "batch_interval", 5.0),
+            "workload": getattr(config, "workload", "mixed"),
+            "prompt_len_distribution": getattr(config, "prompt_len_distribution", "uniform"),
+            "long_prompt_ratio": getattr(config, "long_prompt_ratio", 0.0),
+            "short_input_len": getattr(config, "short_input_len", 0),
+            "long_input_len": getattr(config, "long_input_len", 0),
+            "short_output_len": getattr(config, "short_output_len", 0),
+            "long_output_len": getattr(config, "long_output_len", 0),
+            "max_model_len": getattr(config, "max_model_len", None),
+            "max_num_batched_tokens": getattr(config, "max_num_batched_tokens", 0),
+            "max_num_sequences": getattr(config, "max_num_sequences", 0),
+            "max_prefill_tokens_per_step": getattr(config, "max_prefill_tokens_per_step", 0),
+            "max_prefill_chunk_size": getattr(config, "max_prefill_chunk_size", 0),
         },
         "aggregate": {
             "num_requests": agg.num_requests,
@@ -290,9 +494,12 @@ def export_json(
             "avg_gpu_memory_mb": agg.avg_gpu_memory_mb,
             "avg_gpu_utilization": agg.avg_gpu_utilization,
         },
+        "by_request_type": compute_request_type_breakdown(per_request_list),
+        "engine_stats": engine_stats or {},
         "per_request": [
             {
                 "request_id": r.request_id,
+                "request_type": r.request_type,
                 "status": r.status,
                 "submit_time": r.submit_time,
                 "first_token_time": r.first_token_time,
@@ -402,6 +609,7 @@ async def _launch_with_arrival(
     num_requests: int,
     prompt_token_ids_list: list,
     sampling_params_list: list,
+    request_type_list: list,
     arrival_pattern: str,
     stagger_interval_sec: float,
     rate_rps: float,
@@ -426,7 +634,7 @@ async def _launch_with_arrival(
     if arrival_pattern == "burst":
         for i in range(num_requests):
             task = asyncio.create_task(runner._run_single_request(
-                i, prompt_token_ids_list[i], sampling_params_list[i]
+                i, prompt_token_ids_list[i], sampling_params_list[i], request_type_list[i]
             ))
             tasks.append(task)
         return await asyncio.gather(*tasks, return_exceptions=True)
@@ -434,7 +642,7 @@ async def _launch_with_arrival(
     elif arrival_pattern == "stagger":
         for i in range(num_requests):
             task = asyncio.create_task(runner._run_single_request(
-                i, prompt_token_ids_list[i], sampling_params_list[i]
+                i, prompt_token_ids_list[i], sampling_params_list[i], request_type_list[i]
             ))
             tasks.append(task)
             if i < num_requests - 1:
@@ -445,7 +653,7 @@ async def _launch_with_arrival(
         interval = 1.0 / rate_rps if rate_rps > 0 else 0.0
         for i in range(num_requests):
             task = asyncio.create_task(runner._run_single_request(
-                i, prompt_token_ids_list[i], sampling_params_list[i]
+                i, prompt_token_ids_list[i], sampling_params_list[i], request_type_list[i]
             ))
             tasks.append(task)
             if i < num_requests - 1 and interval > 0:
@@ -470,7 +678,7 @@ async def _launch_with_arrival(
             for i in range(sent, batch_end):
                 tasks.append(asyncio.create_task(
                     runner._run_single_request(
-                        i, prompt_token_ids_list[i], sampling_params_list[i]
+                        i, prompt_token_ids_list[i], sampling_params_list[i], request_type_list[i]
                     )
                 ))
             sent = batch_end
@@ -485,7 +693,7 @@ async def _launch_with_arrival(
         rng = random.Random(seed)
         for i in range(num_requests):
             tasks.append(asyncio.create_task(runner._run_single_request(
-                i, prompt_token_ids_list[i], sampling_params_list[i]
+                i, prompt_token_ids_list[i], sampling_params_list[i], request_type_list[i]
             )))
             if i < num_requests - 1:
                 interval = rng.expovariate(rate_rps) if rate_rps > 0 else 0.0
@@ -537,6 +745,7 @@ class DirectEngineRunner:
         idx: int,
         prompt_token_ids: list,
         sampling_params,
+        request_type: str = "unknown",
     ) -> PerRequestMetrics:
         """Execute a single request through the engine with concurrency control."""
         async with self._semaphore:
@@ -544,6 +753,7 @@ class DirectEngineRunner:
             first_token_time = 0.0
             completion_time = 0.0
             final_output = None
+            completion_token_ids = []
 
             try:
                 gen = self._engine.generate(prompt_token_ids, sampling_params)
@@ -551,8 +761,9 @@ class DirectEngineRunner:
                 async def _consume():
                     nonlocal first_token_time, completion_time, final_output
                     async for output in gen:
-                        if first_token_time == 0.0:
+                        if output.token_ids and first_token_time == 0.0:
                             first_token_time = time.perf_counter()
+                        completion_token_ids.extend(output.token_ids)
                         if output.finished:
                             completion_time = time.perf_counter()
                             final_output = output
@@ -563,16 +774,19 @@ class DirectEngineRunner:
                     # Extract metrics from RequestOutput fields
                     # (populated by AsyncLLMEngine when finished=True)
                     prompt_tokens = len(final_output.prompt_token_ids)
-                    completion_tokens = len(final_output.token_ids)
+                    completion_tokens = len(completion_token_ids)
                     ttft = (
                         final_output.ttft
                         if final_output.ttft is not None
-                        else (first_token_time - submit_time)
+                        else ((first_token_time - submit_time) if first_token_time else 0.0)
                     )
                     tpot = (
                         final_output.tpot
                         if final_output.tpot is not None
-                        else ((completion_time - submit_time) / max(completion_tokens, 1))
+                        else (
+                            (completion_time - first_token_time) / max(completion_tokens-1, 1)
+                            if first_token_time and completion_tokens > 1 else 0.0
+                        )
                     )
                     total_time = (
                         final_output.total_time
@@ -600,6 +814,7 @@ class DirectEngineRunner:
                         ttft=ttft,
                         tpot=tpot,
                         total_time=total_time,
+                        request_type=request_type,
                     )
                 else:
                     if self._verbose:
@@ -610,6 +825,7 @@ class DirectEngineRunner:
                         submit_time=submit_time,
                         prompt_tokens=len(prompt_token_ids),
                         error_message="No output generated from engine",
+                        request_type=request_type,
                     )
 
             except asyncio.TimeoutError:
@@ -621,6 +837,7 @@ class DirectEngineRunner:
                     submit_time=submit_time,
                     prompt_tokens=len(prompt_token_ids),
                     error_message=f"Timeout after {self._timeout:.1f}s",
+                    request_type=request_type,
                 )
             except Exception as e:
                 if self._verbose:
@@ -631,12 +848,20 @@ class DirectEngineRunner:
                     submit_time=submit_time,
                     prompt_tokens=len(prompt_token_ids),
                     error_message=f"{type(e).__name__}: {e}",
+                    request_type=request_type,
                 )
+
+    async def get_engine_stats(self) -> dict:
+        """Return instrumentation counters from the in-process engine."""
+        if self._engine is None:
+            return {}
+        return self._engine.get_stats()
 
     async def run(
         self,
         prompt_token_ids_list: list,
         sampling_params_list: list,
+        request_type_list: list,
         arrival_pattern: str,
         stagger_interval_sec: float,
         rate_rps: float,
@@ -666,6 +891,7 @@ class DirectEngineRunner:
             num_requests=num_requests,
             prompt_token_ids_list=prompt_token_ids_list,
             sampling_params_list=sampling_params_list,
+            request_type_list=request_type_list,
             arrival_pattern=arrival_pattern,
             stagger_interval_sec=stagger_interval_sec,
             rate_rps=rate_rps,
@@ -688,6 +914,7 @@ class DirectEngineRunner:
                     submit_time=0.0,
                     prompt_tokens=len(prompt_token_ids_list[i]),
                     error_message=f"Unhandled exception: {result}",
+                    request_type=request_type_list[i],
                 ))
             else:
                 per_request_list.append(PerRequestMetrics(
@@ -696,6 +923,7 @@ class DirectEngineRunner:
                     submit_time=0.0,
                     prompt_tokens=len(prompt_token_ids_list[i]),
                     error_message=f"Unexpected result type: {type(result)}",
+                    request_type=request_type_list[i],
                 ))
 
         return per_request_list, wall_start, wall_end
@@ -769,6 +997,7 @@ class HTTPAPIRunner:
         self._semaphore = asyncio.Semaphore(concurrency)
         self._client = None
         self._server_process = None
+        self._engine_stats = {}
 
     async def _wait_for_server(self, timeout: float = 120.0) -> bool:
         """Poll /health endpoint until server responds 200."""
@@ -809,11 +1038,29 @@ class HTTPAPIRunner:
                 self._server_process.join()
             print("Embedded server stopped.")
 
+    async def get_engine_stats(self) -> dict:
+        """Return instrumentation counters from the HTTP server."""
+        if self._client is None:
+            return dict(self._engine_stats)
+
+        try:
+            response = await self._client.get(
+                f"{self._base_url}/debug/stats",
+                timeout=5.0,
+            )
+            if response.status_code == 200:
+                self._engine_stats = response.json()
+        except Exception as e:
+            if self._verbose:
+                print(f"Failed to fetch engine stats: {type(e).__name__}: {e}")
+        return dict(self._engine_stats)
+
     async def _run_single_request(
         self,
         idx: int,
         prompt_token_ids: list,
         sampling_params,
+        request_type: str = "unknown",
     ) -> PerRequestMetrics:
         """Execute a single request via HTTP with concurrency control."""
         async with self._semaphore:
@@ -856,6 +1103,7 @@ class HTTPAPIRunner:
                                     f"HTTP {response.status_code}: "
                                     f"{error_text.decode('utf-8', errors='replace')[:200]}"
                                 ),
+                                request_type=request_type,
                             )
 
                         async for line in response.aiter_lines():
@@ -870,7 +1118,12 @@ class HTTPAPIRunner:
                                 continue
 
                             if first_token_time == 0.0:
-                                first_token_time = time.perf_counter()
+                                choices = chunk.get("choices") or []
+                                text_delta = ""
+                                if choices:
+                                    text_delta = choices[0].get("text") or ""
+                                if text_delta:
+                                    first_token_time = time.perf_counter()
 
                             # Check for final chunk (has metrics)
                             if "metrics" in chunk and chunk["metrics"] is not None:
@@ -902,6 +1155,7 @@ class HTTPAPIRunner:
                                 f"HTTP {response.status_code}: "
                                 f"{error_text[:200]}"
                             ),
+                            request_type=request_type,
                         )
 
                     data = response.json()
@@ -942,6 +1196,7 @@ class HTTPAPIRunner:
                     ttft=ttft,
                     tpot=tpot,
                     total_time=total_time,
+                    request_type=request_type,
                 )
 
             except httpx.TimeoutException:
@@ -953,6 +1208,7 @@ class HTTPAPIRunner:
                     submit_time=submit_time,
                     prompt_tokens=prompt_tokens,
                     error_message=f"Timeout after {self._timeout:.1f}s",
+                    request_type=request_type,
                 )
             except Exception as e:
                 if self._verbose:
@@ -963,12 +1219,14 @@ class HTTPAPIRunner:
                     submit_time=submit_time,
                     prompt_tokens=prompt_tokens,
                     error_message=f"{type(e).__name__}: {e}",
+                    request_type=request_type,
                 )
 
     async def run(
         self,
         prompt_token_ids_list: list,
         sampling_params_list: list,
+        request_type_list: list,
         arrival_pattern: str,
         stagger_interval_sec: float,
         rate_rps: float,
@@ -1018,6 +1276,7 @@ class HTTPAPIRunner:
             num_requests=num_requests,
             prompt_token_ids_list=prompt_token_ids_list,
             sampling_params_list=sampling_params_list,
+            request_type_list=request_type_list,
             arrival_pattern=arrival_pattern,
             stagger_interval_sec=stagger_interval_sec,
             rate_rps=rate_rps,
@@ -1040,6 +1299,7 @@ class HTTPAPIRunner:
                     submit_time=0.0,
                     prompt_tokens=len(prompt_token_ids_list[i]),
                     error_message=f"Unhandled exception: {result}",
+                    request_type=request_type_list[i],
                 ))
             else:
                 per_request_list.append(PerRequestMetrics(
@@ -1048,7 +1308,10 @@ class HTTPAPIRunner:
                     submit_time=0.0,
                     prompt_tokens=len(prompt_token_ids_list[i]),
                     error_message=f"Unexpected result type: {type(result)}",
+                    request_type=request_type_list[i],
                 ))
+
+        self._engine_stats = await self.get_engine_stats()
 
         # Cleanup
         await self._client.aclose()
@@ -1129,8 +1392,16 @@ Examples:
 
     # ---- Benchmark Parameters ----
     parser.add_argument(
-        "--num-requests", type=int, default=256,
-        help="Total number of requests. Default: 256.",
+        "--scenario", type=str, default="realistic-decode",
+        choices=list(SCENARIO_PRESETS.keys()),
+        help="Benchmark scenario preset. 'realistic-decode' uses Poisson arrivals "
+             "with moderate prompt lengths and long generations, targeting a "
+             "decode-heavy but realistic online workload for max_model_len=8192. "
+             "Explicit CLI arguments override preset values. Default: realistic-decode.",
+    )
+    parser.add_argument(
+        "--num-requests", type=int, default=128,
+        help="Total number of requests. Default: 128.",
     )
     parser.add_argument(
         "--concurrency", type=int, default=32,
@@ -1145,13 +1416,43 @@ Examples:
         help="Maximum generated tokens per request. Default: 1024.",
     )
     parser.add_argument(
-        "--arrival-pattern", type=str, default="batch",
+        "--workload", type=str, default="mixed",
+        choices=["random", "mixed"],
+        help="Request length workload. Default: mixed long-prompt-heavy online workload.",
+    )
+    parser.add_argument(
+        "--prompt-len-distribution", type=str, default="bimodal",
+        choices=["bimodal", "uniform", "lognormal"],
+        help="Prompt length distribution for --workload mixed. Default: bimodal.",
+    )
+    parser.add_argument(
+        "--long-prompt-ratio", type=float, default=0.7,
+        help="Fraction of long-prompt requests for bimodal mixed workload. Default: 0.7.",
+    )
+    parser.add_argument(
+        "--short-input-len", type=int, default=256,
+        help="Upper bound for short prompt length in mixed workload. Default: 256.",
+    )
+    parser.add_argument(
+        "--long-input-len", type=int, default=3072,
+        help="Upper bound for long prompt length in mixed workload. Default: 3072.",
+    )
+    parser.add_argument(
+        "--short-output-len", type=int, default=256,
+        help="Upper bound for short request output length in mixed workload. Default: 256.",
+    )
+    parser.add_argument(
+        "--long-output-len", type=int, default=1024,
+        help="Upper bound for long-prompt request output length in mixed workload. Default: 1024.",
+    )
+    parser.add_argument(
+        "--arrival-pattern", type=str, default="poisson",
         choices=["burst", "stagger", "continuous", "batch", "poisson"],
         help="Request arrival pattern. 'poisson' uses exponential inter-arrival "
              "times at --rate-rps average rate (best for real-world simulation). "
              "'batch' submits --batch-size requests every --batch-interval seconds "
              "without waiting for previous batches to finish. "
-             "Default: batch.",
+             "Default: poisson.",
     )
     parser.add_argument(
         "--stagger-interval-ms", type=int, default=50,
@@ -1187,12 +1488,26 @@ Examples:
         help="Number of tensor parallel replicas. Default: 1.",
     )
     parser.add_argument(
-        "--max-num-batched-tokens", type=int, default=4096,
-        help="Maximum total tokens per batch. Default: 4096.",
+        "--max-model-len", type=int, default=None,
+        help="Maximum model context length for direct/embedded-server mode. "
+             "For external HTTP mode, start the server with the same --max-model-len. "
+             "Default: engine default.",
     )
     parser.add_argument(
-        "--max-num-sequences", type=int, default=256,
-        help="Maximum concurrent sequences in scheduler. Default: 256.",
+        "--max-num-batched-tokens", type=int, default=16384,
+        help="Maximum total tokens per batch. Default: 16384.",
+    )
+    parser.add_argument(
+        "--max-num-sequences", type=int, default=512,
+        help="Maximum concurrent sequences in scheduler. Default: 512.",
+    )
+    parser.add_argument(
+        "--max-prefill-tokens-per-step", type=int, default=8192,
+        help="Maximum total Prefill tokens scheduled in one logical step. Default: 8192.",
+    )
+    parser.add_argument(
+        "--max-prefill-chunk-size", type=int, default=4096,
+        help="Maximum Prefill chunk size for a single sequence. Default: 4096.",
     )
     parser.add_argument(
         "--gpu-memory-utilization", type=float, default=0.9,
@@ -1217,7 +1532,7 @@ Examples:
         help="Random seed for reproducibility. Default: 42.",
     )
 
-    return parser.parse_args()
+    return apply_scenario_preset(parser.parse_args())
 
 
 async def main() -> None:
@@ -1229,11 +1544,23 @@ async def main() -> None:
     print("=" * 66)
     print(f" Model            : {args.model}")
     print(f" Mode             : {args.mode}")
+    print(f" Scenario         : {args.scenario}")
     print(f" Streaming        : {args.stream}")
     print(f" Requests         : {args.num_requests}")
     print(f" Concurrency      : {args.concurrency}")
     print(f" Max Input Len    : {args.max_input_len}")
     print(f" Max Output Len   : {args.max_output_len}")
+    print(f" Max Model Len    : {args.max_model_len or 'engine default'}")
+    print(f" Batch Tokens     : {args.max_num_batched_tokens}")
+    print(f" Max Sequences    : {args.max_num_sequences}")
+    print(f" Prefill Tokens   : {args.max_prefill_tokens_per_step}")
+    print(f" Prefill Chunk    : {args.max_prefill_chunk_size}")
+    print(f" Workload         : {args.workload}")
+    if args.workload == "mixed":
+        print(f" Prompt Dist      : {args.prompt_len_distribution}")
+        print(f" Long Prompt Ratio: {args.long_prompt_ratio:.2f}")
+        print(f" Short/Long Input : {args.short_input_len} / {args.long_input_len}")
+        print(f" Short/Long Output: {args.short_output_len} / {args.long_output_len}")
     print(f" Arrival Pattern  : {args.arrival_pattern}")
     if args.arrival_pattern == "batch":
         print(f" Batch Size       : {args.batch_size}")
@@ -1247,17 +1574,31 @@ async def main() -> None:
     print("=" * 66)
 
     # Generate test data
-    prompt_token_ids_list, sampling_params_list = generate_random_test_data(
-        num_requests=args.num_requests,
-        max_input_len=args.max_input_len,
-        max_output_len=args.max_output_len,
-        seed_val=args.seed,
-    )
+    if args.workload == "mixed":
+        prompt_token_ids_list, sampling_params_list, request_type_list = generate_mixed_test_data(
+            num_requests=args.num_requests,
+            prompt_len_distribution=args.prompt_len_distribution,
+            short_input_len=args.short_input_len,
+            long_input_len=args.long_input_len,
+            short_output_len=args.short_output_len,
+            long_output_len=args.long_output_len,
+            long_prompt_ratio=args.long_prompt_ratio,
+            seed_val=args.seed,
+        )
+    else:
+        prompt_token_ids_list, sampling_params_list, request_type_list = generate_random_test_data(
+            num_requests=args.num_requests,
+            max_input_len=args.max_input_len,
+            max_output_len=args.max_output_len,
+            seed_val=args.seed,
+        )
     total_prompt = sum(len(p) for p in prompt_token_ids_list)
     total_max_gen = sum(sp.max_tokens for sp in sampling_params_list)
+    type_counts = {t: request_type_list.count(t) for t in sorted(set(request_type_list))}
     print(f"\nGenerated {args.num_requests} requests: "
           f"{total_prompt:,} total prompt tokens, "
           f"up to {total_max_gen:,} generation tokens")
+    print(f"Request types: {type_counts}")
 
     # Build engine kwargs (only used for direct mode or embedded server)
     engine_kwargs = {
@@ -1265,8 +1606,12 @@ async def main() -> None:
         "tensor_parallel_size": args.tensor_parallel_size,
         "max_num_batched_tokens": args.max_num_batched_tokens,
         "max_num_sequences": args.max_num_sequences,
+        "max_prefill_tokens_per_step": args.max_prefill_tokens_per_step,
+        "max_prefill_chunk_size": args.max_prefill_chunk_size,
         "gpu_memory_utilization": args.gpu_memory_utilization,
     }
+    if args.max_model_len is not None:
+        engine_kwargs["max_model_length"] = args.max_model_len
 
     # Create runner
     if args.mode == "direct":
@@ -1301,6 +1646,7 @@ async def main() -> None:
     run_fn = lambda: runner.run(
         prompt_token_ids_list,
         sampling_params_list,
+        request_type_list,
         args.arrival_pattern,
         stagger_interval_sec,
         args.rate_rps,
@@ -1337,12 +1683,22 @@ async def main() -> None:
         avg_gpu_utilization=gpu_sampler.avg_utilization,
     )
 
+    engine_stats = await runner.get_engine_stats()
+
     # Print report
     print_report(args, agg)
+    print_request_type_breakdown(per_request_list)
+    print_engine_stats(engine_stats)
 
     # Export JSON if requested
     if args.output:
-        export_json(agg, per_request_list, args.output, config=args)
+        export_json(
+            agg,
+            per_request_list,
+            args.output,
+            config=args,
+            engine_stats=engine_stats,
+        )
 
 
 if __name__ == "__main__":

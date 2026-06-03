@@ -435,6 +435,79 @@ class AsyncLLMEngine:
     # Phase 3: Single Engine Iteration
     # =========================================================================
 
+    def _route_engine_outputs(
+        self,
+        outputs: list[tuple[int, list[int], bool]],
+    ) -> None:
+        """Convert engine token deltas to RequestOutput and route them."""
+
+        request_outputs: list[RequestOutput] = []
+
+        for seq_id, completion_token_ids, finished in outputs:
+            # Look up request_id from forward mapping. Keep mappings alive until
+            # the final chunk so intermediate streaming deltas can keep routing.
+            if finished:
+                request_id = self._seq_to_request.pop(seq_id, None)
+            else:
+                request_id = self._seq_to_request.get(seq_id)
+
+            if request_id is not None:
+                # Normal path: found corresponding request_id.
+                if finished:
+                    # Request completed: clean prompt and reverse mapping.
+                    prompt_token_ids = self._prompt_map.pop(request_id, [])
+                    self._request_to_seq.pop(request_id, None)
+                else:
+                    prompt_token_ids = self._prompt_map.get(request_id, [])
+            else:
+                # The sequence may have been aborted after it was scheduled.
+                prompt_token_ids = []
+                request_id = -1
+
+            # Decode this step's completion delta to text.
+            text = self.tokenizer.decode(completion_token_ids)
+
+            # Compute per-request timing metrics.
+            ttft = None
+            tpot = None
+            total_time = None
+            if request_id in self._request_timings:
+                timing = self._request_timings[request_id]
+                now = time.time()
+                timing["num_tokens"] = timing.get("num_tokens", 0) + len(completion_token_ids)
+                if completion_token_ids and "first_token_time" not in timing:
+                    timing["first_token_time"] = now
+
+                if finished:
+                    timing = self._request_timings.pop(request_id)
+                    arrival = timing["arrival_time"]
+                    completion = now
+                    total_time = completion-arrival
+                    first_token_time = timing.get("first_token_time")
+                    num_tokens = timing.get("num_tokens", 0)
+                    if first_token_time is not None:
+                        ttft = first_token_time-arrival
+                        tpot = (
+                            (completion-first_token_time)/max(num_tokens-1, 1)
+                            if num_tokens > 1 else 0.0
+                        )
+                    else:
+                        ttft = total_time
+                        tpot = 0.0
+
+            request_outputs.append(RequestOutput(
+                request_id=request_id,
+                text=text,
+                token_ids=completion_token_ids,
+                finished=finished,
+                prompt_token_ids=prompt_token_ids,
+                ttft=ttft,
+                tpot=tpot,
+                total_time=total_time,
+            ))
+
+        self._request_tracker.process_step_outputs(request_outputs)
+
     async def _engine_step(self) -> bool:
         """
         Execute one complete inference step of the engine.
@@ -448,30 +521,23 @@ class AsyncLLMEngine:
           2. Process aborts first (free KV cache blocks before scheduling)
           3. Land new requests to scheduler (with per-request error handling)
           4. Check if there is work to do
-          5. Execute engine.step() in thread pool (with catastrophic error handling)
-          6. Route outputs to corresponding streams
+          5. Schedule one logical batch
+          6. Execute Decode sub-batch first and route its outputs immediately
+          7. Execute Prefill sub-batch and route any first-token outputs
 
         Error Handling Strategy (Two-Level):
           Level 1 - Per-request errors: If adding a single request fails,
                     propagate exception to that request's stream only.
                     Other requests continue unaffected.
-          Level 2 - Catastrophic errors: If engine.step() itself fails,
+          Level 2 - Catastrophic errors: If scheduling or model execution fails,
                     all active requests get the exception.
                     All scheduler state is cleaned up.
 
         Returns:
-            True if engine.step() was executed, False if idle.
+            True if a scheduler iteration was executed, False if idle.
 
-        About engine.step() return value:
-          LLMEngine.step() returns list[tuple[int, list[int]]] — a list of
-          (seq_id, completion_token_ids) for completed sequences only
-          (filtered by seq.is_finished).
-          This means:
-            - Prefill phase: outputs is usually [] (sequence not completed yet)
-            - Intermediate decode steps: outputs is [] (still generating token by token)
-            - Final step: outputs contains (seq_id, completion_token_ids) (EOS/reached max_tokens)
-          Therefore, each request typically has only one RequestOutput (finished=True),
-          returning all generated text at once when request completes.
+        Decode output is routed before Prefill starts. This preserves streaming
+        TTFT even when the same logical scheduler iteration also admits Prefill.
         """
 
         # =====================================================================
@@ -533,14 +599,34 @@ class AsyncLLMEngine:
             return False
 
         # =====================================================================
-        # (5) Execute engine.step() with catastrophic error handling
+        # (5) Execute one logical step with Decode routed before Prefill
         # =====================================================================
         loop = asyncio.get_running_loop()
         try:
-            outputs = await loop.run_in_executor(
+            batch = await loop.run_in_executor(
                 None,
-                self.engine.step,
+                self.engine.schedule,
             )
+
+            if batch.decode_sequences:
+                outputs = await loop.run_in_executor(
+                    None,
+                    self.engine.run_scheduled,
+                    batch.decode_sequences,
+                )
+                self._route_engine_outputs(outputs)
+
+                # Give streaming clients a chance to consume Decode tokens while
+                # the following Prefill sub-batch runs in the executor.
+                await asyncio.sleep(0)
+
+            if batch.prefill_sequences:
+                outputs = await loop.run_in_executor(
+                    None,
+                    self.engine.run_scheduled,
+                    batch.prefill_sequences,
+                )
+                self._route_engine_outputs(outputs)
         except Exception as e:
             # Level 2: Catastrophic engine failure.
             # This means the model runner itself failed (GPU OOM, CUDA error,
@@ -569,78 +655,6 @@ class AsyncLLMEngine:
             # (already propagated above). The loop exits, and a new one
             # will be lazily created on the next generate() call.
             raise
-
-        # =====================================================================
-        # (6) Route outputs to request streams
-        # =====================================================================
-        request_outputs: list[RequestOutput] = []
-
-        for seq_id, completion_token_ids in outputs:
-            # Look up and clean request_id from forward mapping
-            request_id = self._seq_to_request.pop(seq_id, None)
-
-            if request_id is not None:
-                # Normal path: found corresponding request_id.
-                # Get and remove prompt_token_ids from _prompt_map.
-                # Why pop instead of get?
-                #   - Request completed, prompt info written to RequestOutput, no longer needed
-                #   - Clean up promptly to release memory (especially important for long prompts)
-                prompt_token_ids = self._prompt_map.pop(request_id, [])
-                # Also clean reverse mapping (request completed normally).
-                # pop() is idempotent-safe: returns None if key missing.
-                self._request_to_seq.pop(request_id, None)
-            else:
-                # Abnormal path: seq_id not found in mapping.
-                # This can happen when the sequence was aborted between
-                # schedule() and step() — the abort cleaned the mappings,
-                # but the model runner still produced output for it.
-                #
-                # Example: if request_id=5 with seq_id=3 was aborted between
-                # schedule() and step(), the abort already popped
-                # _seq_to_request[3] -> None. When step() returns output for
-                # seq_id=3, _seq_to_request.pop(3) returns None.
-                #
-                # Degradation: use placeholder values. The output will be
-                # silently dropped by process_request_output() since the
-                # stream was already finished.
-                prompt_token_ids = []
-                request_id = -1
-
-            # Decode completion tokens to text
-            text = self.tokenizer.decode(completion_token_ids)
-
-            # Compute per-request timing metrics.
-            # In the current engine, engine.step() only returns completed
-            # sequences, so these are end-to-end values. TTFT is approximated
-            # as the full latency (arrival -> completion), and TPOT is the
-            # average time per generated token. These will become precise
-            # when per-step incremental output is supported.
-            ttft = None
-            tpot = None
-            total_time = None
-            if request_id in self._request_timings:
-                timing = self._request_timings.pop(request_id)
-                arrival = timing["arrival_time"]
-                completion = time.time()
-                total_time = completion - arrival
-                num_tokens = len(completion_token_ids)
-                ttft = total_time  # end-to-end latency as TTFT proxy
-                tpot = total_time / num_tokens if num_tokens > 0 else 0.0
-
-            # Build RequestOutput
-            request_outputs.append(RequestOutput(
-                request_id=request_id,
-                text=text,
-                token_ids=completion_token_ids,
-                finished=True,
-                prompt_token_ids=prompt_token_ids,
-                ttft=ttft,
-                tpot=tpot,
-                total_time=total_time,
-            ))
-
-        # Batch route all outputs to corresponding streams
-        self._request_tracker.process_step_outputs(request_outputs)
 
         return True
 
@@ -954,6 +968,11 @@ class AsyncLLMEngine:
         #     Remove timing info for this request to prevent memory leaks.
         #     Pop is safe even if request was never added to _request_timings.
         self._request_timings.pop(request_id, None)
+
+    def get_stats(self) -> dict[str, dict[str, int]]:
+        """Return engine instrumentation counters."""
+
+        return self.engine.get_stats()
 
     # =========================================================================
     # Lifecycle Management

@@ -8,6 +8,8 @@ class Config:
     model: str
     max_num_batched_tokens: int = 16384
     max_num_sequences: int = 512
+    max_prefill_tokens_per_step: int = 8192
+    max_prefill_chunk_size: int = 4096
     max_model_length: int = 4096
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
@@ -63,6 +65,15 @@ class Config:
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_length = min(self.max_model_length, self.hf_config.max_position_embeddings)
         assert self.max_num_batched_tokens >= self.max_model_length
+        self.max_prefill_tokens_per_step = min(
+            self.max_prefill_tokens_per_step,
+            self.max_num_batched_tokens,
+        )
+        self.max_prefill_chunk_size = min(
+            self.max_prefill_chunk_size,
+            self.max_prefill_tokens_per_step,
+        )
+        assert self.max_prefill_tokens_per_step >= 1
+        assert self.max_prefill_chunk_size >= 1
         assert isinstance(self.host, str) and len(self.host) > 0
         assert isinstance(self.port, int) and 1 <= self.port <= 65535
-    

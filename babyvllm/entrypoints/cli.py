@@ -121,6 +121,18 @@ Examples:
              "Default: 512 (matching Config default).",
     )
     parser.add_argument(
+        "--max-prefill-tokens-per-step", type=int, default=8192,
+        help="Maximum total Prefill tokens scheduled in one logical step. "
+             "Decode tokens use the remaining scheduler budget first. "
+             "Default: 8192.",
+    )
+    parser.add_argument(
+        "--max-prefill-chunk-size", type=int, default=4096,
+        help="Maximum Prefill chunk size for a single sequence. "
+             "Keeps long prompts from monopolizing the Prefill window. "
+             "Default: 4096.",
+    )
+    parser.add_argument(
         "--max-model-len", type=int, default=None,
         help="Override the maximum model context length. "
              "If not set, uses the model's default max_position_embeddings from HF config, "
@@ -195,6 +207,8 @@ def build_engine_kwargs(args: argparse.Namespace) -> dict:
     engine_kwargs = {
         "max_num_batched_tokens": args.max_num_batched_tokens,
         "max_num_sequences": args.max_num_sequences,
+        "max_prefill_tokens_per_step": args.max_prefill_tokens_per_step,
+        "max_prefill_chunk_size": args.max_prefill_chunk_size,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "tensor_parallel_size": args.tensor_parallel_size,
         "enforce_eager": args.enforce_eager,

@@ -8,7 +8,7 @@ import numpy as np
 
 from babyvllm.config import Config
 from babyvllm.engine.sequence import Sequence
-from babyvllm.engine.scheduler import Scheduler
+from babyvllm.engine.scheduler import Scheduler, ScheduledBatch
 from babyvllm.engine.model_runner import ModelRunner
 from babyvllm.sampling_params import SamplingParams
 
@@ -105,25 +105,42 @@ class LLMEngine:
         self.scheduler.add_sequence(seq)
         return len(prompt_token_ids)
 
-    def step(self) -> list[tuple[int, list[int]]]:
-        """ Run the model for scheduled sequences. """
+    def schedule(self) -> ScheduledBatch:
+        """Select one logical batch, split into Decode and Prefill sub-batches."""
 
-        # (1) Schedule sequences.
-        scheduled_sequences = self.scheduler.schedule()
-        # There is no sequence to schedule.
+        return self.scheduler.schedule()
+
+    def run_scheduled(self, scheduled_sequences: list[Sequence]) -> list[tuple[int, list[int], bool]]:
+        """Run one physical sub-batch and return per-request token deltas."""
+
         if not scheduled_sequences:
             return []
-        
-        # (2) Run the model.
+
         outputs = self.model_runner.call('run', scheduled_sequences)
-        
-        # (3) Postprocess the model outputs.
-        self.scheduler.postprocess(scheduled_sequences, outputs)
-        
-        # (4) Collect finished sequences.
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in scheduled_sequences if seq.is_finished]
-        
+        return self.scheduler.postprocess(scheduled_sequences, outputs)
+
+    def step(self) -> list[tuple[int, list[int], bool]]:
+        """Run one logical step, executing Decode before Prefill physically."""
+
+        batch = self.schedule()
+        if not batch:
+            return []
+
+        outputs = []
+        outputs.extend(self.run_scheduled(batch.decode_sequences))
+        outputs.extend(self.run_scheduled(batch.prefill_sequences))
         return outputs
+
+    def get_stats(self) -> dict[str, dict[str, int]]:
+        """Return scheduler and model runner instrumentation counters."""
+
+        model_runner_stats = {}
+        if hasattr(self, "model_runner") and self.model_runner is not None:
+            model_runner_stats = self.model_runner.call("get_stats")
+        return {
+            "scheduler": self.scheduler.get_stats(),
+            "model_runner": model_runner_stats,
+        }
 
     def generate(
         self,
@@ -178,13 +195,13 @@ class LLMEngine:
             gpu_utilizations.append(gpu_util)
 
             # Update generated tokens and track TTFT
-            for seq_id, tokens in outputs:
+            for seq_id, tokens, _finished in outputs:
                 if seq_id not in sequence_start_times:
                     sequence_start_times[seq_id] = inference_start_time
                 if seq_id not in first_token_times and len(tokens) > 0:
                     first_token_times[seq_id] = time.time()
-                sequence_token_counts[seq_id] = len(tokens)
-                generated_tokens[seq_id] = tokens
+                generated_tokens.setdefault(seq_id, []).extend(tokens)
+                sequence_token_counts[seq_id] = len(generated_tokens[seq_id])
                 
         # Sort generated tokens by sequence id. So, the output text are in the same order as user input.
         generated_tokens = [generated_tokens[seq_id] for seq_id in sorted(generated_tokens.keys())]

@@ -1074,6 +1074,18 @@ async def health():
     return Response(status_code=200)
 
 
+@app.get("/debug/stats")
+async def debug_stats():
+    """Return lightweight scheduler/model-runner instrumentation counters."""
+
+    if _engine is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Engine not initialized. Start the server with babyvllm-server --model <path>",
+        )
+    return _engine.get_stats()
+
+
 @app.get("/v1/models")
 async def show_available_models():
     """
@@ -1363,6 +1375,8 @@ async def _non_stream_completion(
     """
     final_output: Optional[RequestOutput] = None
     engine_request_id: Optional[int] = None  # Capture engine's internal int ID for abort
+    completion_text_parts: list[str] = []
+    completion_token_ids: list[int] = []
 
     # Consume all outputs from the async generator.
     # In current engine, only 1 output per request (when finished).
@@ -1371,6 +1385,8 @@ async def _non_stream_completion(
         async for output in _engine.generate(prompt, sampling_params):
             if engine_request_id is None:
                 engine_request_id = output.request_id
+            completion_text_parts.append(output.text)
+            completion_token_ids.extend(output.token_ids)
             final_output = output
     except asyncio.CancelledError:
         # Client disconnected — ensure engine-side cleanup.
@@ -1396,7 +1412,7 @@ async def _non_stream_completion(
     #   Generated: " Bob"
     #   echo=False → " Bob"
     #   echo=True  → "Hello, my name is Bob"
-    text = final_output.text
+    text = "".join(completion_text_parts)
     if echo:
         prompt_text = _engine.tokenizer.decode(final_output.prompt_token_ids)
         text = prompt_text + text
@@ -1413,8 +1429,8 @@ async def _non_stream_completion(
     # completion_tokens = number of generated tokens (new tokens only)
     usage = UsageInfo(
         prompt_tokens=len(final_output.prompt_token_ids),
-        completion_tokens=len(final_output.token_ids),
-        total_tokens=len(final_output.prompt_token_ids) + len(final_output.token_ids),
+        completion_tokens=len(completion_token_ids),
+        total_tokens=len(final_output.prompt_token_ids) + len(completion_token_ids),
     )
 
     # Extract per-request timing metrics from RequestOutput (if available).
@@ -1464,11 +1480,15 @@ async def _non_stream_chat_completion(
     """
     final_output: Optional[RequestOutput] = None
     engine_request_id: Optional[int] = None  # Capture engine's internal int ID for abort
+    completion_text_parts: list[str] = []
+    completion_token_ids: list[int] = []
 
     try:
         async for output in _engine.generate(prompt_token_ids, sampling_params):
             if engine_request_id is None:
                 engine_request_id = output.request_id
+            completion_text_parts.append(output.text)
+            completion_token_ids.extend(output.token_ids)
             final_output = output
     except asyncio.CancelledError:
         # Client disconnected — ensure engine-side cleanup.
@@ -1489,15 +1509,15 @@ async def _non_stream_chat_completion(
     # Wrap generated text in ChatMessage with role="assistant"
     choice = ChatCompletionResponseChoice(
         index=0,
-        message=ChatMessage(role="assistant", content=final_output.text),
+        message=ChatMessage(role="assistant", content="".join(completion_text_parts)),
         finish_reason="stop" if final_output.finished else None,
     )
 
     # CR-4: Compute usage info
     usage = UsageInfo(
         prompt_tokens=len(final_output.prompt_token_ids),
-        completion_tokens=len(final_output.token_ids),
-        total_tokens=len(final_output.prompt_token_ids) + len(final_output.token_ids),
+        completion_tokens=len(completion_token_ids),
+        total_tokens=len(final_output.prompt_token_ids) + len(completion_token_ids),
     )
 
     # Extract per-request timing metrics from RequestOutput (if available).
@@ -1572,6 +1592,8 @@ async def _stream_completion(
     """
     created = int(time.time())
     engine_request_id: Optional[int] = None  # Capture engine's internal int ID for abort
+    echo_prefix_sent = False
+    completion_token_ids: list[int] = []
     try:
         async for output in _engine.generate(prompt, sampling_params):
             # Capture engine request_id on first output for abort() calls.
@@ -1587,11 +1609,11 @@ async def _stream_completion(
             # Uses a monkey-patched attribute on the output object as a flag.
             # This is a pragmatic solution — avoids maintaining external state
             # while keeping the async generator self-contained.
-            if echo and not getattr(output, "_echo_prefix_sent", False):
+            if echo and not echo_prefix_sent:
                 prompt_text = _engine.tokenizer.decode(output.prompt_token_ids)
                 text = prompt_text + text
-                # Mark that echo prefix has been sent for this output stream
-                output._echo_prefix_sent = True  # type: ignore[attr-defined]
+                echo_prefix_sent = True
+            completion_token_ids.extend(output.token_ids)
 
             choice = CompletionResponseChoice(
                 index=0,
@@ -1605,8 +1627,8 @@ async def _stream_completion(
             if output.finished:
                 usage = UsageInfo(
                     prompt_tokens=len(output.prompt_token_ids),
-                    completion_tokens=len(output.token_ids),
-                    total_tokens=len(output.prompt_token_ids) + len(output.token_ids),
+                    completion_tokens=len(completion_token_ids),
+                    total_tokens=len(output.prompt_token_ids) + len(completion_token_ids),
                 )
                 if output.ttft is not None or output.tpot is not None or output.total_time is not None:
                     metrics = MetricsInfo(
@@ -1692,6 +1714,7 @@ async def _stream_chat_completion(
     created = int(time.time())
     is_first: bool = True  # Track whether this is the first chunk for role inclusion
     engine_request_id: Optional[int] = None  # Capture engine's internal int ID for abort
+    completion_token_ids: list[int] = []
     try:
         async for output in _engine.generate(prompt_token_ids, sampling_params):
             # Capture engine request_id on first output for abort() calls.
@@ -1708,10 +1731,8 @@ async def _stream_chat_completion(
                 delta.role = "assistant"
                 is_first = False
 
-            # Always include the content delta
-            # In current engine: this is the full generated text (only one output per request)
-            # In future: this will be per-token deltas
             delta.content = output.text
+            completion_token_ids.extend(output.token_ids)
 
             choice = ChatCompletionResponseStreamChoice(
                 index=0,
@@ -1725,8 +1746,8 @@ async def _stream_chat_completion(
             if output.finished:
                 usage = UsageInfo(
                     prompt_tokens=len(output.prompt_token_ids),
-                    completion_tokens=len(output.token_ids),
-                    total_tokens=len(output.prompt_token_ids) + len(output.token_ids),
+                    completion_tokens=len(completion_token_ids),
+                    total_tokens=len(output.prompt_token_ids) + len(completion_token_ids),
                 )
                 if output.ttft is not None or output.tpot is not None or output.total_time is not None:
                     metrics = MetricsInfo(

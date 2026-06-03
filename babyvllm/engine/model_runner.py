@@ -48,6 +48,10 @@ class ModelRunner:
 
         # Set by prepare_forward() and consumed by run() to avoid re-computing is_decode_only.
         self._is_decode_only = False
+        self.stats = {
+            "cuda_graph_replay": 0,
+            "eager": 0,
+        }
 
         # Track model for cleanup on failure.
         self.model = None
@@ -158,6 +162,11 @@ class ModelRunner:
             return method(*args)
         else:
             raise ValueError(f"Unknown method: {method_name}")
+
+    def get_stats(self) -> dict[str, int]:
+        """Return model runner instrumentation counters."""
+
+        return dict(self.stats)
     
     def exit(self):
         # Close shared memory.
@@ -315,12 +324,6 @@ class ModelRunner:
                 slot_mapping=slot_mapping[:batch_size],
                 block_tables=block_tables[:batch_size],
                 context_lens=context_lens[:batch_size],
-                num_decode_seqs=batch_size,
-                num_decode_tokens=batch_size,
-                prefill_max_seqlen_q=0,
-                prefill_max_seqlen_k=0,
-                cu_seqlens_q_offset=0,
-                cu_seqlens_k_offset=0,
             )
             # Warm up.
             # Complete memory allocation before capturing CUDA graph,
@@ -363,38 +366,12 @@ class ModelRunner:
     
     def prepare_forward(self, seqs: list[Sequence]) -> torch.Tensor:
         """
-        Unified data preparation for both prefill, chunked prefill, decode, and mixed batches.
-        """
+        Unified data preparation for prefill, chunked prefill, and decode.
 
-        # Sort sequences so Decode is before Prefill.
-        # Sorting rules:
-        #   (1) Decode (q_len=1) comes first.  Decode => sort key=0, Prefill => sort key=1
-        #   (2) Within Prefill group, larger chunk_size comes first to reduce KV cache fragmentation.
-        #
-        # How to judge if a sequence is Decode:
-        # (num_computed_tokens>0) and (num_computed_tokens==num_tokens-1)
-        #
-        # For example, if the batch has 5 sequences:
-        #   Seq A: num_computed=100, num_tokens=101, chunk=1   -> decode,   key=(0, -1)
-        #   Seq B: num_computed=200, num_tokens=201, chunk=1   -> decode,   key=(0, -1)
-        #   Seq C: num_computed=50,  num_tokens=256, chunk=100 -> prefill,  key=(1, -100)
-        #   Seq D: num_computed=0,   num_tokens=256, chunk=256 -> prefill,  key=(1, -256)
-        #   Seq E: num_computed=30,  num_tokens=128, chunk=50  -> prefill,  key=(1, -50)
-        # Sorted order: [A, B, D, C, E]
-        #   Decode: A, B (num_decode_seqs=2, num_decode_tokens=2)
-        #   Prefill: D(256), C(100), E(50)
-        #
-        # sort_permutation[i]: 
-        #   The original index of the i-th sequence in the sorted batch.
-        #   Used in `run()` to recover the original order of the sampled token_ids.
-        #   For example: 
-        #   [A, B, C, D, E] -> Sorted order: [A, B, D, C, E] -> sort_permutation = [0, 1, 3, 2, 4]
-        indexed_seqs = sorted(enumerate(seqs), key=lambda pair: (
-            0 if (pair[1].num_computed_tokens > 0 and pair[1].num_computed_tokens == pair[1].num_tokens - 1) else 1,
-            -(pair[1].chunk_size if hasattr(pair[1], 'chunk_size') else 0)
-        ))
-        self._sort_permutation = [idx for idx, _ in indexed_seqs]  # sort_permutation[i] = original_index
-        seqs = [seq for _, seq in indexed_seqs]
+        The scheduler/engine executes Decode and Prefill as separate physical
+        forwards, so this method preserves the given sequence order and prepares
+        metadata for one physical sub-batch only.
+        """
 
         # All tokens and their positions that will be passed to the model for forward pass.
         input_ids = []
@@ -482,31 +459,6 @@ class ModelRunner:
         # Save on the instance so run() can reuse it without a second O(N) scan.
         self._is_decode_only = all(seq.num_computed_tokens > 0 and seq.num_computed_tokens == seq.num_tokens-1 for seq in seqs)
 
-        # Calculate split point for mixed batch reordering.
-        # After sorting, Decode sequences are first, Prefill sequences are after.
-        # Count how many are Decode sequences — this is our "split point" between the two groups.
-        # Since each Decode sequence contributes exactly 1 token,
-        # num_decode_tokens == num_decode_seqs.
-        # Example: after reorder, seqs = [D0, D1, D2, P0, P1]
-        #   num_decode_seqs = 3  (The first 3 sequences are Decode sequences.)
-        #   num_decode_tokens = 3  (The first 3 positions in q tensor are Decode tokens.)
-        #   Prefill tokens start from q[3].
-        num_decode_seqs = sum(1 for s in seqs if s.num_computed_tokens > 0 and s.num_computed_tokens == s.num_tokens - 1)
-        num_decode_tokens = num_decode_seqs
-
-        # Pre-compute Prefill sub-batch scalars on the CPU side to avoid
-        # GPU-CPU sync (.item()) in Attention.forward().
-        if num_decode_seqs < len(seqs):
-            prefill_max_seqlen_q = max(seqlens_q[num_decode_seqs:])
-            prefill_max_seqlen_k = max(seqlens_k[num_decode_seqs:])
-            cu_seqlens_q_offset = cu_seqlens_q[num_decode_seqs]
-            cu_seqlens_k_offset = cu_seqlens_k[num_decode_seqs]
-        else:
-            prefill_max_seqlen_q = 0
-            prefill_max_seqlen_k = 0
-            cu_seqlens_q_offset = 0
-            cu_seqlens_k_offset = 0
-
         set_context(
             is_prefill=not self._is_decode_only,
             cu_seqlens_q=torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
@@ -516,12 +468,6 @@ class ModelRunner:
             slot_mapping=torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             block_tables=block_tables_tensor,
             context_lens=torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-            num_decode_seqs=num_decode_seqs,
-            num_decode_tokens=num_decode_tokens,
-            prefill_max_seqlen_q=prefill_max_seqlen_q,
-            prefill_max_seqlen_k=prefill_max_seqlen_k,
-            cu_seqlens_q_offset=cu_seqlens_q_offset,
-            cu_seqlens_k_offset=cu_seqlens_k_offset,
         )
         
         return input_ids, positions
@@ -541,9 +487,11 @@ class ModelRunner:
         # but CUDA graph can not capture variable tensor shape.
         # So, only when the batch is in pure decode phase and eager mode is not used, we can use CUDA graph.
         if not is_decode_only or self.enforce_eager:
+            self.stats["eager"] += 1
             hidden_states = self.model(input_ids, positions)
             logits = self.model.compute_logits(hidden_states)
         else:
+            self.stats["cuda_graph_replay"] += 1
             bs = input_ids.size(0)
             context = get_context()
 
@@ -573,20 +521,10 @@ class ModelRunner:
     def run(self, seqs: list[Sequence]) -> list[int]:
         """ Run model inference for a batch of sequences and return output token ids. """
 
-        # Prepare sampling temperatures in original order before prepare_forward
-        # reorders sequences. They will be reordered below to match sorted logits.
-        temperatures_original = self.prepare_sample(seqs) if self.rank == 0 else None
+        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
 
         # Prepare the data for forward pass (prefill or decode).
-        # prepare_forward() sorts seqs internally (Decode first, Prefill after)
-        # and records the permutation in self._sort_permutation.
         input_ids, positions = self.prepare_forward(seqs)
-
-        # Reorder temperatures to match the sorted logits order.
-        if self.rank == 0:
-            temperatures = temperatures_original[self._sort_permutation]
-        else:
-            temperatures = None
 
         # Execute model inference.
         # is_decode_only was already computed in prepare_forward() and saved on the instance.
@@ -594,17 +532,7 @@ class ModelRunner:
 
         # Sample tokens from logits.
         # Convert token ids to list of int, since sequence only supports int token ids.
-        if self.rank == 0:
-            # token_ids_sorted has len(seqs) entries — one sampled token per sequence
-            # in sorted order (Decode first, Prefill after).
-            token_ids_sorted = self.sampler(logits, temperatures).tolist()
-            # Unsort back to original sequence order.
-            # _sort_permutation[i] = original_index of the i-th sorted sequence.
-            token_ids = [0] * len(seqs)
-            for sorted_pos, original_pos in enumerate(self._sort_permutation):
-                token_ids[original_pos] = token_ids_sorted[sorted_pos]
-        else:
-            token_ids = None
+        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
 
         # Reset context for next forward pass.
         reset_context()

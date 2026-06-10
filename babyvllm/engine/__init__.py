@@ -1,6 +1,4 @@
-from babyvllm.sampling_params import SamplingParams
-
-__all__ = ["LLMEngine", "SamplingParams"]
+__all__ = ["LLMEngine"]
 
 def __getattr__(name):
     if name == "LLMEngine":

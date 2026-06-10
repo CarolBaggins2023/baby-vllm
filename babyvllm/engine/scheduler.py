@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from collections import deque
 
 from babyvllm.config import Config
@@ -30,8 +32,21 @@ class Scheduler:
         """ Check if all sequences have finished. """
         
         return len(self.waiting) == 0 and len(self.running) == 0
+
+    def _raise_if_unschedulable(self, seq: Sequence):
+        if len(seq) > self.max_num_batched_tokens:
+            raise RuntimeError(
+                f"Sequence {seq.seq_id} has {len(seq)} tokens, which exceeds "
+                f"max_num_batched_tokens ({self.max_num_batched_tokens})."
+            )
+        if seq.num_blocks > self.block_manager.num_blocks:
+            raise RuntimeError(
+                f"Sequence {seq.seq_id} requires {seq.num_blocks} KV cache blocks, "
+                f"but only {self.block_manager.num_blocks} blocks are available."
+            )
     
     def add_sequence(self, sequence: Sequence):
+        self._raise_if_unschedulable(sequence)
         self.waiting.append(sequence)
     
     def preempt(self, seq: Sequence):
@@ -50,6 +65,7 @@ class Scheduler:
         # Try schedule prefilling sequences from waiting queue.
         while self.waiting and len(scheduled_sequences) < self.max_num_sequences:
             seq = self.waiting[0]
+            self._raise_if_unschedulable(seq)
             if self.block_manager.can_allocate(seq) and len(seq)+current_scheduled_tokens <= self.max_num_batched_tokens:
                 # Allocate resources for the sequence.
                 self.block_manager.allocate(seq)
@@ -75,10 +91,14 @@ class Scheduler:
                 if self.running:
                     self.preempt(self.running.pop())
                 # Otherwise, the sequence can not be scheduled.
-                # It can only free its cached blocks and wait for the next scheduling.
+                # There is no sequence left to preempt, so no future scheduler
+                # iteration can create the missing block either.
                 else:
-                    self.preempt(seq)
-                    break
+                    raise RuntimeError(
+                        f"Sequence {seq.seq_id} cannot append a KV cache block: "
+                        f"it requires {seq.num_blocks} blocks, but only "
+                        f"{self.block_manager.num_blocks} blocks are available."
+                    )
             else:
                 if current_scheduled_tokens >= self.max_num_batched_tokens:
                     self.running.appendleft(seq)

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from enum import Enum, auto
 from itertools import count
 from copy import copy

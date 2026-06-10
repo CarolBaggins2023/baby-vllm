@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import math
 import pickle
 import torch
@@ -38,7 +40,8 @@ class ModelRunner:
         
         # Initialize distributed process group.
         self.rank = rank
-        dist.init_process_group(backend='nccl', init_method='tcp://localhost:12345', world_size=config.tensor_parallel_size, rank=rank)
+        if not dist.is_initialized():
+            dist.init_process_group(backend='nccl', init_method='tcp://localhost:12345', world_size=config.tensor_parallel_size, rank=rank)
         torch.cuda.set_device(rank)
         torch.set_default_device(f'cuda:{rank}')
         
@@ -326,11 +329,17 @@ class ModelRunner:
         for seq in seqs:
             token_ids = seq.token_ids
             num_cached_tokens = seq.num_cached_tokens
+            num_uncached_tokens = len(token_ids)-num_cached_tokens
+            if num_uncached_tokens <= 0:
+                raise ValueError(
+                    f"Sequence {seq.seq_id} has no uncached query tokens for prefill. "
+                    "Prefix cache must leave at least one prompt token uncached."
+                )
             # Combining seperate sequences into a long sequence,
             # which enables efficient processing with variable length sequences.
             input_ids.extend(token_ids[num_cached_tokens:])
             positions.extend(list(range(num_cached_tokens, len(seq))))
-            seqlens_q.append(len(token_ids)-num_cached_tokens)
+            seqlens_q.append(num_uncached_tokens)
             seqlens_k.append(len(token_ids))
             cu_seqlens_q.append(cu_seqlens_q[-1]+seqlens_q[-1])
             cu_seqlens_k.append(cu_seqlens_k[-1]+seqlens_k[-1])

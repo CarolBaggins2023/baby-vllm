@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import xxhash
 from collections import deque
 import numpy as np
@@ -22,12 +24,15 @@ class Block:
     
     def update(self, h: int, token_ids: list[int]):
         self.hash = h
-        self.token_ids = token_ids
+        self.token_ids = list(token_ids)
     
-    def reset(self):
+    def clear_metadata(self):
         self.token_ids = []
         self.hash = -1
-        self.ref_count = 1
+
+    def reset(self):
+        self.clear_metadata()
+        self.ref_count = 0
         
 class BlockManager:
     """
@@ -37,6 +42,7 @@ class BlockManager:
     
     def __init__(self, num_blocks: int, block_size: int):
         # The number of tokens in each block.
+        self.num_blocks = num_blocks
         self.block_size = block_size
         self.blocks = [Block(i) for i in range(num_blocks)]
         
@@ -84,9 +90,17 @@ class BlockManager:
         # Integer digest is more convenient to store and compare than the byte stream.
         return h.intdigest()
     
+    def _remove_hash_mapping(self, block: Block):
+        if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block.block_id:
+            del self.hash_to_block_id[block.hash]
+
+    def _move_free_to_used(self, block_id: int):
+        self.free_block_ids.remove(block_id)
+        self.used_block_ids.add(block_id)
+
     def _allocate_block(self, block_id: int) -> Block:
         """
-        Allocate a block with given block id. And manage the free and used block ids.
+        Allocate a free block for new content and clear any stale cache metadata.
         Args:
             block_id: The id of block to allocate.
         
@@ -95,9 +109,28 @@ class BlockManager:
         """
         block = self.blocks[block_id]
         assert block.ref_count == 0, f"Block {block_id} is already allocated."
-        block.reset()
-        self.free_block_ids.remove(block_id)
-        self.used_block_ids.add(block_id)
+        self._remove_hash_mapping(block)
+        block.clear_metadata()
+        block.ref_count = 1
+        self._move_free_to_used(block_id)
+        return block
+
+    def _activate_cached_block(self, block_id: int) -> Block:
+        """
+        Move an unreferenced cached block back to used state without clearing metadata.
+        """
+        block = self.blocks[block_id]
+        assert block.ref_count == 0, f"Block {block_id} is already allocated."
+        assert block_id in self.free_block_ids, f"Block {block_id} is not available for activation."
+        block.ref_count = 1
+        self._move_free_to_used(block_id)
+        return block
+
+    def _reference_cached_block(self, block_id: int) -> Block:
+        block = self.blocks[block_id]
+        assert block.ref_count > 0, f"Block {block_id} is not allocated."
+        assert block_id in self.used_block_ids, f"Block {block_id} is not in used block set."
+        block.ref_count += 1
         return block
     
     def _deallocate_block(self, block_id: int):
@@ -108,53 +141,98 @@ class BlockManager:
         """
         block = self.blocks[block_id]
         assert block.ref_count == 0, f"Block {block_id} cannot be deallocated because it is referenced by {block.ref_count} seqeuences."
-        block.token_ids = []
+        if block.hash == -1:
+            block.clear_metadata()
         self.free_block_ids.append(block_id)
         self.used_block_ids.remove(block_id)
+
+    def _find_cached_block_id(self, h: int, token_ids: list[int]) -> int:
+        if h == -1:
+            return -1
+
+        block_id = self.hash_to_block_id.get(h, -1)
+        if block_id == -1:
+            return -1
+
+        block = self.blocks[block_id]
+        if block.hash != h:
+            if self.hash_to_block_id.get(h) == block_id:
+                del self.hash_to_block_id[h]
+            return -1
+        if block.token_ids != token_ids:
+            return -1
+        return block_id
+
+    def _max_cacheable_blocks(self, seq: Sequence) -> int:
+        # Keep the block containing the final prompt token uncached so prefill
+        # still produces logits for sampling the first completion token.
+        return max((len(seq)-1)//self.block_size, 0)
+
+    def _build_allocation_plan(self, seq: Sequence):
+        h = -1
+        max_cacheable_blocks = self._max_cacheable_blocks(seq)
+        allocation_plan = []
+
+        for i in range(seq.num_blocks):
+            token_ids = seq.block(i)
+            h = self.compute_hash(token_ids=token_ids, prefix_hash_value=h) if len(token_ids) == self.block_size else -1
+            cached_block_id = -1
+            if i < max_cacheable_blocks:
+                cached_block_id = self._find_cached_block_id(h, token_ids)
+            allocation_plan.append((token_ids, h, cached_block_id))
+
+        return allocation_plan
+
+    def _num_free_blocks_needed(self, allocation_plan) -> int:
+        num_free_blocks_needed = 0
+        counted_cached_blocks = set()
+        for _, _, cached_block_id in allocation_plan:
+            if cached_block_id == -1:
+                num_free_blocks_needed += 1
+            elif cached_block_id not in self.used_block_ids and cached_block_id not in counted_cached_blocks:
+                num_free_blocks_needed += 1
+                counted_cached_blocks.add(cached_block_id)
+        return num_free_blocks_needed
+
+    def _allocate_non_reserved_block(self, reserved_block_ids: set[int]) -> Block:
+        for block_id in list(self.free_block_ids):
+            if block_id not in reserved_block_ids:
+                return self._allocate_block(block_id)
+        raise RuntimeError("No free KV cache block is available for allocation.")
     
     def can_allocate(self, seq: Sequence) -> bool:
         """
         Check whether the block manager can allocate `num_blocks` blocks for the sequence.
         """
-        return seq.num_blocks <= len(self.free_block_ids)
+        if seq.num_blocks > self.num_blocks:
+            return False
+        allocation_plan = self._build_allocation_plan(seq)
+        return self._num_free_blocks_needed(allocation_plan) <= len(self.free_block_ids)
     
     def allocate(self, seq: Sequence):
-        # Initial hash value. -1 means no previous block.
-        h = -1
+        allocation_plan = self._build_allocation_plan(seq)
+        reserved_cached_blocks = {
+            cached_block_id
+            for _, _, cached_block_id in allocation_plan
+            if cached_block_id != -1 and cached_block_id not in self.used_block_ids
+        }
+
         # The sequence needs `num_blocks` blocks to store all tokens,
         # so the block manager needs to allocate `num_blocks` blocks for the sequence.
-        for i in range(seq.num_blocks):
-            # Get the token ids in range of i-th block of the sequence.
-            token_ids = seq.block(i)
-            # If the block is full, then compute the hash value of the block.
-            # Otherwise, set the hash value of the block to -1.
-            h = self.compute_hash(token_ids=token_ids, prefix_hash_value=h) if len(token_ids) == self.block_size else -1
-            # Fetch the block id from hash value to block id mapping.
-            # If the hash value is not found, then set the block id to -1, which means cache miss.
-            block_id = self.hash_to_block_id.get(h, -1)
-            
-            # `no_cache_found == False` means an existing block can be reused.
-            # `no_cache_found == True` means a new block needs to be allocated.
-            no_cache_found = False
-            # `block_id == -1` means cache miss.
-            # `self.blocks[block_id].token_ids != token_ids` means hash collision.
-            # Both cache miss and hash collision means no cache found.
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
-                no_cache_found = True
-            
-            if not no_cache_found:
+        for token_ids, h, cached_block_id in allocation_plan:
+            if cached_block_id != -1:
                 # Update sequence information.
                 seq.num_cached_tokens += self.block_size
                 
                 # Update block information.
-                if block_id in self.used_block_ids:
-                    block = self.blocks[block_id]
-                    block.ref_count += 1
+                if cached_block_id in self.used_block_ids:
+                    block = self._reference_cached_block(cached_block_id)
                 # The block used to store this segment of token ids, but now it is not allocated.
                 else:
-                    block = self._allocate_block(block_id)
+                    block = self._activate_cached_block(cached_block_id)
+                    reserved_cached_blocks.discard(cached_block_id)
             else:
-                block = self._allocate_block(self.free_block_ids[0])
+                block = self._allocate_non_reserved_block(reserved_cached_blocks)
                 block.update(h, token_ids)
                 # If the block is fulled filled, then record its hash value.
                 if h != -1:

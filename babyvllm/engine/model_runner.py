@@ -40,16 +40,23 @@ class ModelRunner:
         
         # Initialize distributed process group.
         self.rank = rank
+        self.device_id = config.device_id_for_rank(rank)
+        self.shared_memory_name = config.shared_memory_name
         if not dist.is_initialized():
-            dist.init_process_group(backend='nccl', init_method='tcp://localhost:12345', world_size=config.tensor_parallel_size, rank=rank)
-        torch.cuda.set_device(rank)
-        torch.set_default_device(f'cuda:{rank}')
+            dist.init_process_group(
+                backend='nccl',
+                init_method=config.distributed_init_method,
+                world_size=config.tensor_parallel_size,
+                rank=rank,
+            )
+        torch.cuda.set_device(self.device_id)
+        torch.set_default_device(f'cuda:{self.device_id}')
         
         self.default_dtype = config.hf_config.dtype
         torch.set_default_dtype(self.default_dtype)
         
         # Create model and sampler.
-        self.model = Qwen3ForCausalLM(config.hf_config).cuda(rank)
+        self.model = Qwen3ForCausalLM(config.hf_config).cuda(self.device_id)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         
@@ -73,13 +80,13 @@ class ModelRunner:
                 # Clean up existing shared memory.
                 try:
                     # `name` is the unique identifier for shared memory.
-                    old_shm = SharedMemory(name='babyvllm')
+                    old_shm = SharedMemory(name=self.shared_memory_name)
                     old_shm.close()
                     old_shm.unlink()
                 except FileNotFoundError:
                     pass
                 # Create new shared memory.
-                self.shm = SharedMemory(name='babyvllm', create=True, size=2**20)
+                self.shm = SharedMemory(name=self.shared_memory_name, create=True, size=2**20)
                 # Ensure rank 1 accesses shared memory after rank 0 create it.
                 dist.barrier()
             else:
@@ -87,7 +94,7 @@ class ModelRunner:
                 dist.barrier()
                 # Child processes link to the shared memory created by rank 0.
                 # (No parameter `create=True` means link to existing shared memory, but not create it.)
-                self.shm = SharedMemory(name='babyvllm')
+                self.shm = SharedMemory(name=self.shared_memory_name)
                 # Do not call `loop()` in child processes' `__init__`, or it will stuck in an infinite loop.
     
     """
@@ -149,14 +156,21 @@ class ModelRunner:
             raise ValueError(f"Unknown method: {method_name}")
     
     def exit(self):
+        if getattr(self, '_exited', False):
+            return
+        self._exited = True
+
         # Close shared memory.
-        if self.world_size > 1:
+        if self.world_size > 1 and hasattr(self, 'shm'):
             self.shm.close()
             if self.rank == 0:
-                self.shm.unlink()
+                try:
+                    self.shm.unlink()
+                except FileNotFoundError:
+                    pass
         
         # Delete CUDA graphs.
-        if not self.enforce_eager:
+        if not self.enforce_eager and hasattr(self, 'graphs'):
             del self.graphs, self.graph_vars, self.graph_pool
         torch.cuda.synchronize()
         
@@ -222,7 +236,7 @@ class ModelRunner:
         # ===== (3) Allocate memory for kv cache. =====
         # Although `allocated_kv_cache` is a local variable, it will not be deleted out of the function,
         # because it will be referred by kv cache variables in model layers.
-        allocated_kv_cache = torch.empty(2, num_layers, self.config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim, device=f'cuda:{self.rank}')
+        allocated_kv_cache = torch.empty(2, num_layers, self.config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim, device=f'cuda:{self.device_id}')
 
         # ===== (4) Divide the giant kv cache pool into blocks and assign blocks to layers in model. =====
         layer_id = 0
@@ -241,12 +255,12 @@ class ModelRunner:
         
         # Create fake inputs for capturing CUDA graph with maximum batch size and maximum sequence length.
         # In decode phase, input is a single token id for each sequence, so the shape is always (batch_size,).
-        input_ids = torch.zeros(max_bs, dtype=torch.int64, device=f'cuda:{self.rank}')
-        positions = torch.zeros(max_bs, dtype=torch.int64, device=f'cuda:{self.rank}')
-        slot_mapping = torch.zeros(max_bs, dtype=torch.int32, device=f'cuda:{self.rank}')
-        context_lens = torch.zeros(max_bs, dtype=torch.int32, device=f'cuda:{self.rank}')
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=f'cuda:{self.rank}')
-        outputs = torch.zeros(max_bs, self.config.hf_config.hidden_size, device=f'cuda:{self.rank}')
+        input_ids = torch.zeros(max_bs, dtype=torch.int64, device=f'cuda:{self.device_id}')
+        positions = torch.zeros(max_bs, dtype=torch.int64, device=f'cuda:{self.device_id}')
+        slot_mapping = torch.zeros(max_bs, dtype=torch.int32, device=f'cuda:{self.device_id}')
+        context_lens = torch.zeros(max_bs, dtype=torch.int32, device=f'cuda:{self.device_id}')
+        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=f'cuda:{self.device_id}')
+        outputs = torch.zeros(max_bs, self.config.hf_config.hidden_size, device=f'cuda:{self.device_id}')
         
         # Which batch sizes we want to capture CUDA graph for.
         self.graph_batch_sizes = [1, 2, 4, 8]+list(range(16,max_bs+1, 16))

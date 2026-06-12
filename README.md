@@ -29,6 +29,13 @@ print(metrics["throughput"], metrics["per_rank"])
 llm.exit()
 ```
 
+## DP and TP Communication
+
+DP and TP use different communication mechanisms because they operate at different parallelism levels:
+
+- **DP is coarse-grained task parallelism.** The coordinator sends prompt subsets to worker replicas and receives outputs and metrics after each worker runs the full model independently. This is **low-frequency control-plane traffic**, so it uses **Python multiprocessing pipes**.
+- **TP is fine-grained model parallelism inside one replica.** TP ranks hold different model shards and must exchange GPU tensors during forward passes with collectives such as all-reduce or all-gather. This is **frequent, large, latency-sensitive data-plane traffic**, so each replica initializes a **`torch.distributed` NCCL process group** with its own **rendezvous URL**.
+
 ## Offline Data Parallel Validation
 
 Use the DP validation in layers:

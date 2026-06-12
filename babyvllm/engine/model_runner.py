@@ -38,11 +38,16 @@ class ModelRunner:
         # Whether to enforce eager execution when running model.
         self.enforce_eager = config.enforce_eager
         
-        # Initialize distributed process group.
+        # Initialize the TP process group. Tensor-parallel ranks hold different
+        # model shards and need torch.distributed collectives during forward.
         self.rank = rank
         self.device_id = config.device_id_for_rank(rank)
         self.shared_memory_name = config.shared_memory_name
         if not dist.is_initialized():
+            # init_method is the torch.distributed rendezvous URL used only to
+            # discover peers and initialize this TP group. The later collective
+            # data path is handled by the NCCL process group, not by repeatedly
+            # sending model tensors through this URL.
             dist.init_process_group(
                 backend='nccl',
                 init_method=config.distributed_init_method,

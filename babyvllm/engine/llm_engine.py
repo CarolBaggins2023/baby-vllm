@@ -31,6 +31,16 @@ def worker_process(config, rank, event):
     model_runner.loop()
 
 
+# DP coordinator/worker Pipe protocol:
+# - Worker -> coordinator: ("ready", rank)
+# - Coordinator -> worker: ("generate", request_id, indices, prompts, sampling_params_list)
+# - Worker -> coordinator: ("result", request_id, rank, indices, outputs, metrics)
+# - Worker -> coordinator: ("error", request_id | None, rank, error_text)
+# - Coordinator -> worker: ("exit",)
+#
+# request_id identifies one coordinator generate() batch. indices contains the
+# original prompt positions assigned to the rank, so the coordinator can restore
+# the caller's output order after workers return.
 def data_parallel_worker_process(model, config_kwargs, connection: Connection):
     """Run one full offline engine replica for a DP rank."""
     import sys
@@ -74,6 +84,7 @@ def data_parallel_worker_process(model, config_kwargs, connection: Connection):
 
 class LLMEngine:
     def __init__(self, model, **kwargs):
+        """Create either a single-replica engine or a parent DP coordinator."""
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k:v for k, v in kwargs.items() if k in config_fields}
         self.config = Config(model, **config_kwargs)
@@ -85,6 +96,8 @@ class LLMEngine:
             for field in fields(Config)
             if field.name not in {"model", "hf_config", "num_kvcache_blocks"}
         }
+        # True only for the parent DP coordinator. This process does not run
+        # the model directly; it launches DP workers and routes requests to them.
         self._is_data_parallel_coordinator = config.data_parallel_size > 1
 
         if self._is_data_parallel_coordinator:
@@ -96,6 +109,7 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def _init_single_replica(self):
+        """Initialize one local engine replica, including any local TP workers."""
         from babyvllm.engine.model_runner import ModelRunner
 
         config = self.config
@@ -127,7 +141,12 @@ class LLMEngine:
         self.scheduler = Scheduler(config)
 
     def _worker_config_kwargs(self, rank: int) -> dict:
+        """Build config kwargs for one DP worker's inner single-replica engine."""
         config_kwargs = dict(self._config_kwargs)
+        # Each DP worker creates its own LLMEngine, but it must run as a single
+        # DP replica, not another DP coordinator, to avoid recursively spawning
+        # more DP workers. TP settings are preserved, so that replica can still
+        # launch its local TP workers.
         config_kwargs.update(
             data_parallel_size=1,
             data_parallel_world_size=self.config.effective_data_parallel_size,
@@ -139,19 +158,34 @@ class LLMEngine:
         return config_kwargs
 
     def _init_data_parallel_workers(self):
+        """Launch one full engine replica process per DP rank and wait for readiness."""
+        # Use spawn to start each DP worker as a fresh Python process. This is
+        # safer for CUDA/NCCL than inheriting the parent's process state.
         ctx = mp.get_context("spawn")
         self.dp_processes = []
         self.dp_connections = []
         self._dp_request_id = 0
 
         for rank in range(self.config.data_parallel_size):
+            # Pipe creates one dedicated two-ended channel for this DP rank:
+            # parent_conn stays in the coordinator process, and child_conn is
+            # passed to this worker process. Each worker gets its own parent-side
+            # endpoint, so the coordinator must keep parent_conn, not child_conn.
             parent_conn, child_conn = ctx.Pipe()
+            # Note: because spawn is used, these arguments are pickled and sent
+            # to the child process. Therefore the target function usually must
+            # be a module-level function, not a closure created in some local
+            # scope. data_parallel_worker_process lives at the top level of this
+            # file, which satisfies that requirement.
             process = ctx.Process(
                 target=data_parallel_worker_process,
                 args=(self._model, self._worker_config_kwargs(rank), child_conn),
                 name=f"babyvllm_dp_rank_{rank}",
             )
             process.start()
+            # This does not close the connection inside the child process; it
+            # closes only the duplicate handle held by the parent process. That
+            # keeps resources tidy and avoids confusing Pipe lifetime checks.
             child_conn.close()
             self.dp_processes.append(process)
             self.dp_connections.append(parent_conn)
@@ -164,12 +198,13 @@ class LLMEngine:
             raise
 
     def _wait_for_worker_ready(self, rank: int):
+        """Wait for one DP worker to finish initializing its local replica."""
         message = self._recv_data_parallel_message(rank, request_id=None)
         if not isinstance(message, tuple) or message != ("ready", rank):
             raise RuntimeError(f"Malformed ready message from DP rank {rank}: {message!r}")
         
     def exit(self):
-        """ Clean up resources when the program exits. """
+        """Release either DP coordinator workers or local replica resources."""
         if self._exited:
             return
         self._exited = True
@@ -187,6 +222,7 @@ class LLMEngine:
         self.processes = []
 
     def _shutdown_data_parallel_workers(self):
+        """Stop DP worker processes and close the coordinator-side Pipe handles."""
         for connection, process in zip(
             getattr(self, 'dp_connections', []),
             getattr(self, 'dp_processes', []),
@@ -209,6 +245,7 @@ class LLMEngine:
         self.dp_connections = []
 
     def _validate_sampling_params(self, sampling_params: SamplingParams):
+        """Validate generation sampling limits before a request enters the scheduler."""
         if not isinstance(sampling_params, SamplingParams):
             raise ValueError("sampling_params must be a SamplingParams instance or a list of SamplingParams.")
         if not isinstance(sampling_params.max_tokens, int) or isinstance(sampling_params.max_tokens, bool) or sampling_params.max_tokens <= 0:
@@ -227,6 +264,7 @@ class LLMEngine:
                 )
 
     def _validate_prompt_token_ids(self, prompt_token_ids: list[int]):
+        """Validate tokenized prompt input for direct token-id generation."""
         if not isinstance(prompt_token_ids, list):
             raise ValueError("prompt_token_ids must be a list[int].")
         if not prompt_token_ids:
@@ -239,6 +277,7 @@ class LLMEngine:
         prompt: str = None,
         prompt_token_ids: list[int] = None,
     ) -> list[int]:
+        """Convert text prompts to token IDs, or copy already-tokenized prompts."""
         if (prompt is None) == (prompt_token_ids is None):
             raise ValueError("Exactly one of prompt or prompt_token_ids must be provided.")
         if prompt is not None:
@@ -249,6 +288,7 @@ class LLMEngine:
         return list(prompt_token_ids)
 
     def _effective_max_model_length(self, sampling_params: SamplingParams) -> int:
+        """Compute the usable sequence length after engine, KV cache, and request limits."""
         effective_max_model_length = self.config.max_model_length
         if self.config.num_kvcache_blocks > 0:
             kv_cache_token_capacity = self.config.num_kvcache_blocks*self.config.kvcache_block_size
@@ -263,6 +303,7 @@ class LLMEngine:
         prompt: str = None,
         prompt_token_ids: list[int] = None,
     ) -> tuple[list[int], SamplingParams]:
+        """Validate and normalize one request before enqueuing it for local generation."""
         self._validate_sampling_params(sampling_params)
         prompt_token_ids = self._coerce_prompt_token_ids(prompt=prompt, prompt_token_ids=prompt_token_ids)
         effective_max_model_length = self._effective_max_model_length(sampling_params)
@@ -293,6 +334,10 @@ class LLMEngine:
         prompts: list[str],
         sampling_params: SamplingParams,
     ) -> list[SamplingParams]:
+        """Validate batched inputs and expand sampling params to one item per prompt.
+
+        DP uses the returned list when routing each prompt to its assigned rank.
+        """
         if not isinstance(prompts, list):
             raise ValueError("prompts must be a list of strings or a list of token ID lists.")
         if isinstance(sampling_params, list):
@@ -308,6 +353,7 @@ class LLMEngine:
         return sampling_params_list
 
     def _enqueue_request(self, prompt_token_ids: list[int], sampling_params: SamplingParams):
+        """Create a Sequence and add it to this replica's local scheduler."""
         seq = Sequence(token_ids=prompt_token_ids, sampling_params=sampling_params)
         self.scheduler.add_sequence(seq)
         return seq
@@ -318,11 +364,7 @@ class LLMEngine:
         prompt: str = None,
         prompt_token_ids: list[int] = None,
     ) -> int:
-        """
-        Add input prompt to the scheduler's waiting queue.
-        Support both `string` format and `list[int]` format.
-        Return the number of tokens in the prompt.
-        """
+        """Add one request to the local scheduler and return its prompt length."""
 
         prompt_token_ids, sampling_params = self._prepare_request(
             sampling_params=sampling_params,
@@ -333,7 +375,7 @@ class LLMEngine:
         return len(prompt_token_ids)
 
     def step(self) -> tuple[list[int], int, bool]:
-        """ Run the model for scheduled sequences. """
+        """Run one local scheduler/model step for a single replica."""
         
         # (1) Schedule sequences.
         scheduled_sequences, is_prefill = self.scheduler.schedule()
@@ -358,8 +400,11 @@ class LLMEngine:
         prompts: list[str],
         sampling_params: SamplingParams,
     ) -> list[str]:
-        """ Generate text for all input prompts. """
+        """Generate outputs locally, or dispatch the batch when this is a DP coordinator."""
 
+        # A DP coordinator handles generate() by dispatching this batch to its
+        # worker replicas. Single-replica engines, including DP workers, fall
+        # through to the normal local generation path below.
         if getattr(self, "_is_data_parallel_coordinator", False):
             return self._generate_data_parallel(prompts, sampling_params)
 
@@ -474,6 +519,12 @@ class LLMEngine:
 
     @staticmethod
     def _partition_prompt_indices(num_prompts: int, data_parallel_size: int) -> list[list[int]]:
+        """Assign prompt indices to DP ranks with deterministic round-robin routing.
+
+        If prompt lengths or generation lengths are correlated with input order,
+        round-robin routing is more likely to spread that work across DP ranks
+        than contiguous chunks.
+        """
         partitions = [[] for _ in range(data_parallel_size)]
         for idx in range(num_prompts):
             partitions[idx % data_parallel_size].append(idx)
@@ -481,6 +532,7 @@ class LLMEngine:
 
     @staticmethod
     def _aggregate_data_parallel_metrics(per_rank_metrics: dict[int, dict], total_time: float) -> dict:
+        """Merge DP worker metrics and compute coordinator-observed throughput."""
         total_tokens = sum(metrics.get("total_tokens", 0) for metrics in per_rank_metrics.values())
         metrics = {
             "total_tokens": total_tokens,
@@ -521,9 +573,13 @@ class LLMEngine:
         return metrics
 
     def _recv_data_parallel_message(self, rank: int, request_id: int | None):
+        """Receive one DP worker message and turn worker errors/exits into failures."""
         connection = self.dp_connections[rank]
         process = self.dp_processes[rank]
         while True:
+            # poll(0.1) waits up to 0.1s for a message before returning False.
+            # This avoids blocking forever in recv() and lets us detect a worker
+            # process that exited without sending a response.
             if connection.poll(0.1):
                 message = connection.recv()
                 if not isinstance(message, tuple) or not message:
@@ -543,6 +599,7 @@ class LLMEngine:
         prompts: list[str],
         sampling_params: SamplingParams,
     ):
+        """Dispatch a generate batch across DP workers and restore input order."""
         sampling_params_list = self._normalize_generation_inputs(prompts, sampling_params)
         if not prompts:
             return [], self._aggregate_data_parallel_metrics({}, 0)
@@ -559,11 +616,15 @@ class LLMEngine:
             rank_prompts = [prompts[idx] for idx in indices]
             rank_sampling_params = [sampling_params_list[idx] for idx in indices]
             try:
+                # Send the "generate" command defined by the DP Pipe protocol.
                 self.dp_connections[rank].send(
                     ("generate", request_id, indices, rank_prompts, rank_sampling_params)
                 )
             except (BrokenPipeError, EOFError, OSError) as exc:
                 raise RuntimeError(f"DP rank {rank} is not available.") from exc
+            # Only wait for ranks that received work. For example, with DP=4
+            # and 2 prompts, ranks 2 and 3 have empty partitions and will not
+            # send a result for this batch.
             active_ranks.append(rank)
 
         outputs_by_index = {}

@@ -14,12 +14,20 @@ class Config:
     max_model_length: int = 4096
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
+    # Number of full model replicas managed by a parent DP coordinator.
     data_parallel_size: int = 1
+    # This process's DP rank within the full DP world.
     data_parallel_rank: int = 0
+    # Total DP world size. DP workers set data_parallel_size=1 internally but
+    # keep this value so device mapping still sees the full DP layout.
     data_parallel_world_size: int | None = None
+    # Base TCP port used to derive per-DP-rank TP process-group endpoints.
     data_parallel_base_port: int = 12345
+    # Optional physical CUDA device order for all DP*TP logical ranks.
     data_parallel_device_ids: list[int] | None = None
+    # Torch distributed init endpoint for the TP group inside this DP replica.
     distributed_init_method: str | None = None
+    # Shared-memory segment name used by TP workers inside this DP replica.
     shared_memory_name: str | None = None
     enforce_eager: bool = False
     eos: int = -1
@@ -49,6 +57,12 @@ class Config:
         return self.data_parallel_world_size or self.data_parallel_size
 
     def device_id_for_rank(self, tp_rank: int) -> int:
+        """Map a local TP rank in this DP replica to a physical CUDA device.
+
+        By default, DP rank d and TP rank t use device d*tensor_parallel_size+t.
+        If data_parallel_device_ids is provided, that list defines the physical
+        device order for all DP*TP logical ranks.
+        """
         if not isinstance(tp_rank, int) or isinstance(tp_rank, bool):
             raise ValueError("tp_rank must be an integer.")
         if not 0 <= tp_rank < self.tensor_parallel_size:

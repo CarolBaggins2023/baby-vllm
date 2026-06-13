@@ -49,6 +49,7 @@ class Config:
             self.shared_memory_name = self._default_shared_memory_name()
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_length = min(self.max_model_length, self.hf_config.max_position_embeddings)
+        self._validate_qwen3_tensor_parallel_config()
         if self.max_num_batched_tokens < self.max_model_length:
             raise ValueError("max_num_batched_tokens must be at least max_model_length.")
 
@@ -147,4 +148,77 @@ class Config:
 
     def _default_shared_memory_name(self) -> str:
         return f"babyvllm_dp{self.data_parallel_rank}_{os.getpid()}"
+
+    def _validate_qwen3_tensor_parallel_config(self):
+        tp_size = self.tensor_parallel_size
+        num_attention_heads = self._require_positive_int_config("num_attention_heads")
+        num_key_value_heads = getattr(self.hf_config, "num_key_value_heads", None)
+        if num_key_value_heads is None:
+            num_key_value_heads = num_attention_heads
+        elif not isinstance(num_key_value_heads, int) or isinstance(num_key_value_heads, bool) or num_key_value_heads <= 0:
+            raise ValueError("hf_config.num_key_value_heads must be a positive integer when set.")
+        intermediate_size = self._require_positive_int_config("intermediate_size")
+
+        local_num_heads = self._validate_tp_divisibility(
+            field_name="num_attention_heads",
+            value=num_attention_heads,
+            tp_size=tp_size,
+        )
+        local_num_kv_heads = self._validate_tp_divisibility(
+            field_name="num_key_value_heads",
+            value=num_key_value_heads,
+            tp_size=tp_size,
+            extra=(
+                "KV-head replication is not supported by baby-vllm-basic; "
+                f"effective num_key_value_heads={num_key_value_heads}, "
+                f"tensor_parallel_size={tp_size}."
+            ),
+        )
+        local_intermediate_size = self._validate_tp_divisibility(
+            field_name="intermediate_size",
+            value=intermediate_size,
+            tp_size=tp_size,
+        )
+
+        if local_num_heads <= 0:
+            raise ValueError(
+                "tensor_parallel_size produces zero local attention heads: "
+                f"num_attention_heads={num_attention_heads}, tensor_parallel_size={tp_size}."
+            )
+        if local_num_kv_heads <= 0:
+            raise ValueError(
+                "tensor_parallel_size produces zero local KV heads: "
+                f"effective num_key_value_heads={num_key_value_heads}, "
+                f"tensor_parallel_size={tp_size}. KV-head replication is not "
+                "supported by baby-vllm-basic."
+            )
+        if local_intermediate_size <= 0:
+            raise ValueError(
+                "tensor_parallel_size produces zero local MLP features: "
+                f"intermediate_size={intermediate_size}, tensor_parallel_size={tp_size}."
+            )
+
+    def _require_positive_int_config(self, field_name: str) -> int:
+        value = getattr(self.hf_config, field_name, None)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError(f"hf_config.{field_name} must be a positive integer.")
+        return value
+
+    def _validate_tp_divisibility(
+        self,
+        *,
+        field_name: str,
+        value: int,
+        tp_size: int,
+        extra: str | None = None,
+    ) -> int:
+        if value % tp_size != 0:
+            message = (
+                f"hf_config.{field_name}={value} must be divisible by "
+                f"tensor_parallel_size={tp_size}."
+            )
+            if extra is not None:
+                message = f"{message} {extra}"
+            raise ValueError(message)
+        return value // tp_size
     

@@ -168,9 +168,27 @@ class QKVColumnParallelLinear(ColumnParallelLinear):
         """
         self.tp_size = dist.get_world_size()
         self.head_size = head_size
+        if num_heads % self.tp_size != 0:
+            raise ValueError(
+                f"num_heads={num_heads} must be divisible by tensor_parallel_size={self.tp_size}."
+            )
         self.num_heads = num_heads//self.tp_size
-        self.num_kv_heads = num_kv_heads//self.tp_size if num_kv_heads is not None else self.num_heads
-        total_output_size = head_size*(num_heads+2*num_kv_heads)
+        effective_num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        if effective_num_kv_heads % self.tp_size != 0:
+            raise ValueError(
+                "num_kv_heads must be divisible by tensor_parallel_size. "
+                "KV-head replication is not supported by baby-vllm-basic; "
+                f"num_kv_heads={effective_num_kv_heads}, "
+                f"tensor_parallel_size={self.tp_size}."
+            )
+        self.num_kv_heads = effective_num_kv_heads//self.tp_size
+        if self.num_heads <= 0 or self.num_kv_heads <= 0:
+            raise ValueError(
+                "tensor_parallel_size produces zero local Q or KV heads: "
+                f"num_heads={num_heads}, num_kv_heads={effective_num_kv_heads}, "
+                f"tensor_parallel_size={self.tp_size}."
+            )
+        total_output_size = head_size*(num_heads+2*effective_num_kv_heads)
         super().__init__(input_size, total_output_size, bias)
     
     def weight_loader(
@@ -289,6 +307,15 @@ class RowParallelLinear(LinearBase):
         """
         # Calculate the shard size and check if it matches the initialized parameter data size.
         param_data = param.data
+        if param_data.dim() == 1:
+            assert loaded_weights.dim() == 1, "Row-parallel bias must be loaded from a 1D tensor."
+            assert loaded_weights.size(0) == param_data.size(0), (
+                f"Loaded bias size {loaded_weights.size(0)} must be equal to "
+                f"parameter bias size {param_data.size(0)}"
+            )
+            param_data.copy_(loaded_weights)
+            return
+
         full_data_input_size = loaded_weights.size(1)
         shard_size = full_data_input_size//self.tp_size
         assert shard_size == param_data.size(1), f"Shard size {shard_size} must be equal to parameter data size {param_data.size(1)}"
@@ -300,9 +327,11 @@ class RowParallelLinear(LinearBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Row parallel layer usually follows a column parallel layer.
         # `x` is the output of the column parallel layer.
-        result = F.linear(x, self.weight, self.bias)
+        result = F.linear(x, self.weight, None)
         # Reduce the output across all devices.
         if self.tp_size > 1:
             dist.all_reduce(result, op=dist.ReduceOp.SUM)
+        if self.bias is not None:
+            result = result + self.bias
         return result
     

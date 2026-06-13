@@ -4,6 +4,7 @@ from enum import Enum, auto
 from itertools import count
 from copy import copy
 import math
+from typing import Any
 
 from babyvllm.sampling_params import SamplingParams
 
@@ -90,33 +91,93 @@ class Sequence:
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1
+
+    def prefill_uncached_token_count(self) -> int:
+        return len(self.token_ids)-self.num_cached_tokens
+
+    def validate_prefill_state(self) -> int:
+        num_uncached_tokens = self.prefill_uncached_token_count()
+        if num_uncached_tokens <= 0:
+            seq_id = getattr(self, "seq_id", "?")
+            raise ValueError(
+                f"Sequence {seq_id} has no uncached query tokens for prefill "
+                f"(token_ids={len(self.token_ids)}, "
+                f"num_cached_tokens={self.num_cached_tokens}). "
+                "Prefix cache must leave at least one token uncached."
+            )
+        return num_uncached_tokens
+
+    def to_worker_state(self, is_prefill: bool) -> dict[str, Any]:
+        """Build a phase-aware, pickle-friendly state for TP worker ranks."""
+
+        return {
+            "version": 1,
+            "phase": "prefill" if is_prefill else "decode",
+            "seq_id": self.seq_id,
+            "status": self.status.name,
+            "num_tokens": self.num_tokens,
+            "num_prompt_tokens": self.num_prompt_tokens,
+            "num_cached_tokens": self.num_cached_tokens,
+            "block_table": list(self.block_table),
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "ignore_eos": self.ignore_eos,
+            "max_model_length": self.max_model_length,
+            "last_token": self.last_token,
+            "token_ids": list(self.token_ids) if is_prefill else None,
+        }
+
+    @classmethod
+    def from_worker_state(cls, state: dict[str, Any]) -> "Sequence":
+        phase = state.get("phase")
+        if phase == "prefill":
+            token_ids = list(state["token_ids"])
+            if len(token_ids) != state["num_tokens"]:
+                raise ValueError(
+                    "Prefill sequence worker state must include full token_ids "
+                    f"(got {len(token_ids)}, expected {state['num_tokens']})."
+                )
+        elif phase == "decode":
+            token_ids = [state["last_token"]]
+        else:
+            raise ValueError(f"Unknown sequence worker-state phase: {phase!r}")
+
+        seq = cls.__new__(cls)
+        seq.seq_id = state["seq_id"]
+        status = state.get("status", "WAITING")
+        seq.status = SequenceStatus[status] if isinstance(status, str) else status
+        seq.token_ids = token_ids
+        seq.last_token = state["last_token"]
+        seq.num_tokens = state["num_tokens"]
+        seq.num_prompt_tokens = state["num_prompt_tokens"]
+        seq.num_cached_tokens = state["num_cached_tokens"]
+        seq.block_table = list(state["block_table"])
+        seq.temperature = state["temperature"]
+        seq.max_tokens = state["max_tokens"]
+        seq.ignore_eos = state["ignore_eos"]
+        seq.max_model_length = state["max_model_length"]
+        return seq
     
     def __getstate__(self):
-        # If number of completion tokens is 0, then the sequence is in prefill phase.
-        # In prefill phase, returns the whole token ids.
-        # In decode phase, returns only the last token id.
-        return (
-            self.num_tokens,
-            self.num_prompt_tokens,
-            self.num_cached_tokens,
-            self.block_table,
-            self.token_ids if self.num_completion_tokens == 0 else self.last_token
-        )
+        return self.to_worker_state(is_prefill=True)
     
     def __setstate__(self, state):
-        # `state` should be a tuple of
-        # (num_tokens, num_prompt_tokens, num_cached_tokens, block_table, last_token or token_ids)
+        if isinstance(state, dict):
+            restored = self.from_worker_state(state)
+            self.__dict__.update(restored.__dict__)
+            return
+
+        # Backward compatibility for old tuple pickles.
+        self.seq_id = next(Sequence.counter)
+        self.status = SequenceStatus.WAITING
         self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:-1]
-        
-        # In prefill phase, all token ids should be restored.
         if self.num_completion_tokens == 0:
             self.token_ids = state[-1]
-        # In decode phase, only the last token id need to be restored.
-        # Because other token ids are already cached in the KV cache, stored in `block_table`,
-        # it is not necessary to store other token ids, for saving memory.
         else:
             self.token_ids = [state[-1]]
-        
-        # Update the last token id.
         self.last_token = self.token_ids[-1] if self.token_ids else None
+        self.temperature = 1.0
+        self.max_tokens = 64
+        self.ignore_eos = False
+        self.max_model_length = None
     

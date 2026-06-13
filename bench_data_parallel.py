@@ -28,7 +28,7 @@ class Workload:
 @dataclass
 class RunResult:
     dp_size: int
-    tensor_parallel_size: int
+    tp_size: int
     requests: int
     output_tokens: int
     total_tokens: int
@@ -66,39 +66,50 @@ def _parse_int_csv(value: str, flag_name: str) -> list[int]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
-            "Run a dedicated baby-vllm-basic offline data-parallel smoke or "
-            "throughput benchmark."
-        )
+            "Run baby-vllm-basic offline DP/TP smoke validation or throughput "
+            "benchmark."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  TP smoke:      python bench_data_parallel.py --model /path/to/Qwen3-0.6B --mode smoke --dp-sizes 1 --tp-size 2\n"
+            "  DP+TP smoke:   python bench_data_parallel.py --model /path/to/Qwen3-0.6B --mode smoke --dp-sizes 2 --tp-size 2\n"
+            "  TP benchmark:  run separate commands with --tp-size 1, then 2, using the same seed and workload flags."
+        ),
     )
     parser.add_argument("--model", required=True, help="Path to the local model directory.")
     parser.add_argument(
         "--mode",
         choices=("smoke", "benchmark"),
         default="smoke",
-        help="Validation mode. Smoke defaults to DP=2; benchmark defaults to DP=1.",
+        help="Validation mode. Smoke defaults to DP=2, TP=1; benchmark defaults to DP=1, TP=1.",
     )
     parser.add_argument(
         "--dp-sizes",
         default=None,
         help=(
             "Data parallel size for this process. Use one value only, for example "
-            "1 or 2. Run separate commands to compare multiple DP sizes."
+            "1 or 2. Run separate commands to compare DP sizes."
         ),
     )
     parser.add_argument(
-        "--tensor-parallel-size",
         "--tp-size",
+        "--tensor-parallel-size",
+        dest="tp_size",
         type=int,
         default=1,
-        help="Tensor parallel size inside each DP replica.",
+        help=(
+            "Tensor parallel size inside each DP replica. Use one value per "
+            "process; run separate commands to compare TP sizes."
+        ),
     )
     parser.add_argument(
         "--device-ids",
         default=None,
         help=(
             "Optional comma-separated CUDA device ids. Each run uses the first "
-            "DP*TP ids from this list."
+            "DP * TP ids from this list."
         ),
     )
     parser.add_argument("--num-seqs", type=int, default=8, help="Number of requests.")
@@ -171,8 +182,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if args.tensor_parallel_size <= 0:
-        raise ValueError("--tensor-parallel-size must be positive.")
+    if args.tp_size <= 0:
+        raise ValueError("--tp-size must be positive.")
     if len(args.dp_sizes) != 1:
         raise ValueError(
             "--dp-sizes accepts exactly one value per process. Run separate "
@@ -229,23 +240,23 @@ def generate_workload(
     return Workload(prompt_token_ids=prompt_token_ids, sampling_params=sampling_params)
 
 
-def required_cuda_devices(dp_size: int, tensor_parallel_size: int) -> int:
-    return dp_size * tensor_parallel_size
+def required_cuda_devices(dp_size: int, tp_size: int) -> int:
+    return dp_size * tp_size
 
 
 def select_device_ids(
     device_ids: Sequence[int] | None,
     *,
     dp_size: int,
-    tensor_parallel_size: int,
+    tp_size: int,
 ) -> list[int] | None:
     if device_ids is None:
         return None
-    required = required_cuda_devices(dp_size, tensor_parallel_size)
+    required = required_cuda_devices(dp_size, tp_size)
     if len(device_ids) < required:
         raise ValueError(
             f"--device-ids must include at least {required} ids for "
-            f"data_parallel_size={dp_size} and tensor_parallel_size={tensor_parallel_size}."
+            f"data_parallel_size={dp_size} and tensor_parallel_size={tp_size}."
         )
     return list(device_ids[:required])
 
@@ -253,12 +264,12 @@ def select_device_ids(
 def preflight_cuda_devices(
     *,
     dp_size: int,
-    tensor_parallel_size: int,
+    tp_size: int,
     device_ids: Sequence[int] | None = None,
     visible_cuda_devices: int | None = None,
 ) -> None:
     visible = torch.cuda.device_count() if visible_cuda_devices is None else visible_cuda_devices
-    required = required_cuda_devices(dp_size, tensor_parallel_size)
+    required = required_cuda_devices(dp_size, tp_size)
     if visible < required:
         raise ValueError(
             "data_parallel_size*tensor_parallel_size requires "
@@ -267,7 +278,7 @@ def preflight_cuda_devices(
     selected_device_ids = select_device_ids(
         device_ids,
         dp_size=dp_size,
-        tensor_parallel_size=tensor_parallel_size,
+        tp_size=tp_size,
     )
     if selected_device_ids and max(selected_device_ids) >= visible:
         raise ValueError(
@@ -351,14 +362,14 @@ def summarize_per_rank(metrics: dict) -> list[str]:
 def make_result(
     *,
     dp_size: int,
-    tensor_parallel_size: int,
+    tp_size: int,
     request_count: int,
     outputs: Sequence[object],
     metrics: dict,
 ) -> RunResult:
     return RunResult(
         dp_size=dp_size,
-        tensor_parallel_size=tensor_parallel_size,
+        tp_size=tp_size,
         requests=request_count,
         output_tokens=count_output_tokens(outputs),
         total_tokens=int(metrics["total_tokens"]),
@@ -372,10 +383,10 @@ def format_results_table(results: Sequence[RunResult]) -> str:
     blocks = []
     for result in results:
         block = [
-            "baby-vllm-basic",
+            "baby-vllm-basic DP/TP benchmark",
             "",
             f"{'Data Parallel Size':<27}: {result.dp_size}",
-            f"{'Tensor Parallel Size':<27}: {result.tensor_parallel_size}",
+            f"{'Tensor Parallel Size':<27}: {result.tp_size}",
             f"{'Total Requests':<27}: {result.requests} sequences",
             f"{'Total Output Tokens':<27}: {result.output_tokens} tokens",
             f"{'Total Tokens':<27}: {result.total_tokens} tokens",
@@ -398,11 +409,11 @@ def run_single_dp_size(args: argparse.Namespace, workload: Workload, dp_size: in
     selected_device_ids = select_device_ids(
         args.device_ids,
         dp_size=dp_size,
-        tensor_parallel_size=args.tensor_parallel_size,
+        tp_size=args.tp_size,
     )
     preflight_cuda_devices(
         dp_size=dp_size,
-        tensor_parallel_size=args.tensor_parallel_size,
+        tp_size=args.tp_size,
         device_ids=selected_device_ids,
     )
 
@@ -410,13 +421,13 @@ def run_single_dp_size(args: argparse.Namespace, workload: Workload, dp_size: in
     try:
         print(
             "\n"
-            f"Initializing DP={dp_size}, TP={args.tensor_parallel_size}, "
+            f"Initializing DP={dp_size}, TP={args.tp_size}, "
             f"requests={len(workload.prompt_token_ids)}"
         )
         llm = LLMEngine(
             model=args.model,
             enforce_eager=args.enforce_eager,
-            tensor_parallel_size=args.tensor_parallel_size,
+            tensor_parallel_size=args.tp_size,
             data_parallel_size=dp_size,
             data_parallel_device_ids=selected_device_ids,
             max_num_batched_tokens=args.max_num_batched_tokens,
@@ -445,7 +456,7 @@ def run_single_dp_size(args: argparse.Namespace, workload: Workload, dp_size: in
         )
         return make_result(
             dp_size=dp_size,
-            tensor_parallel_size=args.tensor_parallel_size,
+            tp_size=args.tp_size,
             request_count=len(workload.prompt_token_ids),
             outputs=outputs,
             metrics=metrics,
@@ -479,10 +490,10 @@ def run_benchmark(args: argparse.Namespace) -> list[RunResult]:
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = parse_args(argv)
-        print(f"baby-vllm DP {args.mode}")
+        print(f"baby-vllm DP/TP {args.mode}")
         print(
             f"model={args.model}, dp_sizes={args.dp_sizes}, "
-            f"tp_size={args.tensor_parallel_size}, seed={args.seed}"
+            f"tp_size={args.tp_size}, seed={args.seed}"
         )
         results = run_benchmark(args)
         print("\nResults")

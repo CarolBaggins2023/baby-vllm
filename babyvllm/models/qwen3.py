@@ -9,6 +9,30 @@ from babyvllm.layers import *
 from babyvllm.utils import get_context
 
 
+def _tp_checked_divide(
+    *,
+    field_name: str,
+    value: int,
+    tp_size: int,
+    local_name: str,
+    extra: str | None = None,
+) -> int:
+    if value % tp_size != 0:
+        message = (
+            f"{field_name}={value} must be divisible by tensor_parallel_size={tp_size}."
+        )
+        if extra is not None:
+            message = f"{message} {extra}"
+        raise ValueError(message)
+    local_value = value//tp_size
+    if local_value <= 0:
+        raise ValueError(
+            f"tensor_parallel_size={tp_size} produces zero {local_name} "
+            f"from {field_name}={value}."
+        )
+    return local_value
+
+
 class Qwen3Attention(nn.Module):
     """
     Attention Block in Qwen3.
@@ -24,9 +48,20 @@ class Qwen3Attention(nn.Module):
         
         # Each GPU deals with different attention heads.
         self.total_num_heads = config.num_attention_heads
-        self.num_heads = self.total_num_heads//self.tp_size
+        self.num_heads = _tp_checked_divide(
+            field_name="num_attention_heads",
+            value=self.total_num_heads,
+            tp_size=self.tp_size,
+            local_name="local attention heads",
+        )
         self.total_num_kv_heads = config.num_key_value_heads if config.num_key_value_heads is not None else self.total_num_heads
-        self.num_kv_heads = self.total_num_kv_heads//self.tp_size
+        self.num_kv_heads = _tp_checked_divide(
+            field_name="num_key_value_heads",
+            value=self.total_num_kv_heads,
+            tp_size=self.tp_size,
+            local_name="local KV heads",
+            extra="KV-head replication is not supported by baby-vllm-basic.",
+        )
         
         self.head_dim = config.head_dim if config.head_dim is not None else config.hidden_size//config.num_attention_heads
         self.q_size = self.head_dim*self.num_heads
@@ -135,6 +170,12 @@ class Qwen3MLP(nn.Module):
     """
     def __init__(self, config: Qwen3Config):
         super().__init__()
+        _tp_checked_divide(
+            field_name="intermediate_size",
+            value=config.intermediate_size,
+            tp_size=dist.get_world_size(),
+            local_name="local MLP features",
+        )
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=config.hidden_size,
             output_sizes=[config.intermediate_size]*2,

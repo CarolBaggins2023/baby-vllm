@@ -110,6 +110,15 @@ class ModelRunner:
     (5) All processes call the method.
     """
     
+    def _build_worker_message(self, method_name: str, args: tuple):
+        if method_name == 'run':
+            if len(args) != 2:
+                raise ValueError("run worker message expects (seqs, is_prefill).")
+            seqs, is_prefill = args
+            worker_states = [seq.to_worker_state(is_prefill=is_prefill) for seq in seqs]
+            return ('run_worker_state', worker_states, is_prefill)
+        return (method_name, *args)
+
     def write_shm(self, method_name: str, args: tuple):
         """ Write data to shared memory. Only use write when rank == 0. """
         
@@ -118,8 +127,15 @@ class ModelRunner:
         # Flatten. For example, if args is (a, b, c), then (method_name, args) is (method_name, (a, b, c)),
         # and (method_name, *args) is (method_name, a, b, c).
         # `pickle.dumps` converts Python object into binary data.
-        data = pickle.dumps((method_name, *args))
+        data = pickle.dumps(self._build_worker_message(method_name, args))
         n = len(data)
+        if n+4 > len(self.shm.buf):
+            raise ValueError(
+                "TP worker shared-memory payload is too large "
+                f"({n} bytes, capacity {len(self.shm.buf)-4} bytes). "
+                "Reduce max_num_batched_tokens, sequence lengths, or increase "
+                "the shared-memory segment size."
+            )
         # Data structure in shared memory:
         # First 4 bytes store the length of data.
         # Next `n` bytes store the pickled data.
@@ -159,6 +175,10 @@ class ModelRunner:
             return method(*args)
         else:
             raise ValueError(f"Unknown method: {method_name}")
+
+    def run_worker_state(self, seq_states: list[dict], is_prefill: bool) -> list[int]:
+        seqs = [Sequence.from_worker_state(state) for state in seq_states]
+        return self.run(seqs, is_prefill)
     
     def exit(self):
         if getattr(self, '_exited', False):
@@ -230,8 +250,18 @@ class ModelRunner:
         
         # ===== (2) Compute kv cache block size and number of available blocks. =====
         num_layers = self.config.hf_config.num_hidden_layers
-        num_kv_heads = self.config.hf_config.num_key_value_heads//self.world_size
+        total_num_kv_heads = self.config.hf_config.num_key_value_heads
+        if total_num_kv_heads is None:
+            total_num_kv_heads = self.config.hf_config.num_attention_heads
+        num_kv_heads = self._checked_local_tp_dimension(
+            field_name="num_key_value_heads",
+            value=total_num_kv_heads,
+            local_name="local KV heads",
+            extra="KV-head replication is not supported by baby-vllm-basic.",
+        )
         head_dim = self.config.hf_config.head_dim
+        if head_dim is None:
+            head_dim = self.config.hf_config.hidden_size//self.config.hf_config.num_attention_heads
         # size of one kv cache block in bytes
         # "*2" because we need to store both key and value.
         block_size_bytes = self.block_size*2*num_layers*num_kv_heads*head_dim*self.default_dtype.itemsize
@@ -251,6 +281,30 @@ class ModelRunner:
                 module.k_cache = allocated_kv_cache[0, layer_id]
                 module.v_cache = allocated_kv_cache[1, layer_id]
                 layer_id += 1
+
+    def _checked_local_tp_dimension(
+        self,
+        *,
+        field_name: str,
+        value: int,
+        local_name: str,
+        extra: str | None = None,
+    ) -> int:
+        if value % self.world_size != 0:
+            message = (
+                f"{field_name}={value} must be divisible by "
+                f"tensor_parallel_size={self.world_size}."
+            )
+            if extra is not None:
+                message = f"{message} {extra}"
+            raise ValueError(message)
+        local_value = value//self.world_size
+        if local_value <= 0:
+            raise ValueError(
+                f"tensor_parallel_size={self.world_size} produces zero {local_name} "
+                f"from {field_name}={value}."
+            )
+        return local_value
     
     @torch.inference_mode()
     def capture_cudagraph(self):
@@ -348,12 +402,7 @@ class ModelRunner:
         for seq in seqs:
             token_ids = seq.token_ids
             num_cached_tokens = seq.num_cached_tokens
-            num_uncached_tokens = len(token_ids)-num_cached_tokens
-            if num_uncached_tokens <= 0:
-                raise ValueError(
-                    f"Sequence {seq.seq_id} has no uncached query tokens for prefill. "
-                    "Prefix cache must leave at least one prompt token uncached."
-                )
+            num_uncached_tokens = seq.validate_prefill_state()
             # Combining seperate sequences into a long sequence,
             # which enables efficient processing with variable length sequences.
             input_ids.extend(token_ids[num_cached_tokens:])

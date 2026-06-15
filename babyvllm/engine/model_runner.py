@@ -75,9 +75,16 @@ class ModelRunner:
         if not self.enforce_eager:
             self.capture_cudagraph()
         
-        # Setup shared memory for communication between model runners. (multi-process communication)
-        # Rank 0 create the shared memory and child processes link to it.
-        # To avoid collision, should be done after all processes finishing model initialization, warmup and kv cache allocation.
+        # Setup shared memory for control-plane communication between model
+        # runners. Shared memory and Events only carry small Python control
+        # messages, such as which method to call and the arguments needed to
+        # reconstruct Sequence state on worker ranks. Tensor data produced by
+        # model forward is still exchanged through the NCCL process group via
+        # torch.distributed collectives such as all_reduce and gather.
+        #
+        # Rank 0 creates the shared memory and child processes link to it. To
+        # avoid collision, this should be done after all processes finish model
+        # initialization, warmup, and kv cache allocation.
         if self.world_size > 1:
             # Synchronize before setting up.
             dist.barrier()

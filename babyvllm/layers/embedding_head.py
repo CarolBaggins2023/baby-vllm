@@ -78,6 +78,10 @@ class VocabParallelEmbedding(nn.Module):
         # so we need to distinguish them and filter the temporary placeholder generate by "mask == False".
         if self.tp_size > 1:
             output = mask.unsqueeze(-1)*output
+            # Embedding is an input-side vocab-parallel layer. Each token ID is
+            # owned by exactly one vocab shard, so non-owner ranks contribute
+            # zeros and an all-reduce SUM restores the full hidden state on
+            # every TP rank for the following transformer layers.
             dist.all_reduce(output, op=dist.ReduceOp.SUM)
         
         return output
@@ -111,7 +115,10 @@ class ParallelLMHead(VocabParallelEmbedding):
         # logits shape: (total_tokens, num_embeddings_per_partition)
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
-            # GPU 0 gathers the logits from all GPUs.
+            # LM head is an output-side vocab-parallel layer. Each rank computes
+            # logits for only its vocab shard, so the full logits are formed by
+            # concatenating shards, not summing them. Only rank 0 needs the full
+            # vocab logits because sampling is owned by rank 0.
             all_logits = None
             if self.tp_rank == 0:
                 all_logits = [torch.empty(logits.size(), device=logits.device) for _ in range(self.tp_size)]

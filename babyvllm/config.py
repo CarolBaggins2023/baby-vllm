@@ -13,6 +13,9 @@ class Config:
     max_num_sequences: int = 512
     max_model_length: int = 4096
     gpu_memory_utilization: float = 0.9
+    # Number of tensor-parallel ranks inside one model replica. A value greater
+    # than 1 shards model weights, attention heads, KV cache, and vocab logits
+    # across ranks that jointly execute each forward pass.
     tensor_parallel_size: int = 1
     # Number of full model replicas managed by a parent DP coordinator.
     data_parallel_size: int = 1
@@ -150,6 +153,12 @@ class Config:
         return f"babyvllm_dp{self.data_parallel_rank}_{os.getpid()}"
 
     def _validate_qwen3_tensor_parallel_config(self):
+        # TP execution here follows an SPMD-style pattern: every rank runs the
+        # same model code with different parameter shards and participates in
+        # the same NCCL collectives. Rank-local values differ, but tensor shapes
+        # that enter collectives, attention kernels, and KV-cache storage must be
+        # symmetric. baby-vllm-basic keeps this simple by requiring Q heads, KV
+        # heads, and MLP intermediate features to divide evenly by TP size.
         tp_size = self.tensor_parallel_size
         num_attention_heads = self._require_positive_int_config("num_attention_heads")
         num_key_value_heads = getattr(self.hf_config, "num_key_value_heads", None)

@@ -222,6 +222,24 @@ class Qwen3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         residual: torch.Tensor|None = None,
     ) -> torch.Tensor:
+        # TP rhythm inside one decoder layer:
+        #   full hidden state replicated on all ranks
+        #     -> ColumnParallel / MergedColumnParallel
+        #     -> each rank gets a local shard
+        #     -> local compute
+        #     -> RowParallel
+        #     -> all_reduce
+        #     -> full hidden state replicated on all ranks
+        #
+        # Attention follows:
+        #   QKVColumnParallelLinear -> local attention heads -> RowParallelLinear
+        #
+        # MLP follows:
+        #   MergedColumnParallelLinear -> local activation -> RowParallelLinear
+        #
+        # This keeps residual, RMSNorm, and the next decoder layer seeing the
+        # same hidden-state shape on every TP rank.
+
         # (1) Input LayerNorm
         if residual is not None:
             x, residual = self.input_layernorm(x, residual)

@@ -25,6 +25,8 @@ Reference: AsyncStream + RequestTracker from vllm/engine/async_llm_engine.py,
            multi-engine, beam search, and multi-step.
 """
 
+from __future__ import annotations
+
 import asyncio
 from functools import partial
 from typing import Optional, Union

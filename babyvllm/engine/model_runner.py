@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import math
 import pickle
 import torch
@@ -36,18 +38,26 @@ class ModelRunner:
         # Whether to enforce eager execution when running model.
         self.enforce_eager = config.enforce_eager
         
-        # Initialize distributed process group.
+        # Initialize the TP process group. Tensor-parallel ranks hold different
+        # model shards and need torch.distributed collectives during forward.
         self.rank = rank
+        self.device_id = config.device_id_for_rank(rank)
+        self.device = torch.device(f'cuda:{self.device_id}')
+        self.shared_memory_name = config.shared_memory_name
         if not dist.is_initialized():
-            dist.init_process_group(backend='nccl', init_method='tcp://localhost:12345', world_size=config.tensor_parallel_size, rank=rank)
-        torch.cuda.set_device(rank)
-        torch.set_default_device(f'cuda:{rank}')
+            dist.init_process_group(
+                backend='nccl',
+                init_method=config.distributed_init_method,
+                world_size=config.tensor_parallel_size,
+                rank=rank,
+            )
+        self._activate_device()
         
         self.default_dtype = config.hf_config.dtype
         torch.set_default_dtype(self.default_dtype)
         
         # Create model and sampler.
-        self.model = Qwen3ForCausalLM(config.hf_config).cuda(rank)
+        self.model = Qwen3ForCausalLM(config.hf_config).cuda(self.device_id)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         
@@ -71,13 +81,13 @@ class ModelRunner:
                 # Clean up existing shared memory.
                 try:
                     # `name` is the unique identifier for shared memory.
-                    old_shm = SharedMemory(name='babyvllm')
+                    old_shm = SharedMemory(name=self.shared_memory_name)
                     old_shm.close()
                     old_shm.unlink()
                 except FileNotFoundError:
                     pass
                 # Create new shared memory.
-                self.shm = SharedMemory(name='babyvllm', create=True, size=2**20)
+                self.shm = SharedMemory(name=self.shared_memory_name, create=True, size=2**20)
                 # Ensure rank 1 accesses shared memory after rank 0 create it.
                 dist.barrier()
             else:
@@ -85,7 +95,7 @@ class ModelRunner:
                 dist.barrier()
                 # Child processes link to the shared memory created by rank 0.
                 # (No parameter `create=True` means link to existing shared memory, but not create it.)
-                self.shm = SharedMemory(name='babyvllm')
+                self.shm = SharedMemory(name=self.shared_memory_name)
                 # Do not call `loop()` in child processes' `__init__`, or it will stuck in an infinite loop.
     
     """
@@ -96,6 +106,19 @@ class ModelRunner:
     (5) All processes call the method.
     """
     
+    def _build_worker_message(self, method_name: str, args: tuple):
+        if method_name == 'run':
+            if len(args) != 2:
+                raise ValueError("run worker message expects (seqs, is_prefill).")
+            seqs, is_prefill = args
+            worker_states = [seq.to_worker_state(is_prefill=is_prefill) for seq in seqs]
+            return ('run_worker_state', worker_states, is_prefill)
+        return (method_name, *args)
+
+    def _activate_device(self):
+        torch.cuda.set_device(self.device_id)
+        torch.set_default_device(self.device)
+
     def write_shm(self, method_name: str, args: tuple):
         """ Write data to shared memory. Only use write when rank == 0. """
         
@@ -104,8 +127,15 @@ class ModelRunner:
         # Flatten. For example, if args is (a, b, c), then (method_name, args) is (method_name, (a, b, c)),
         # and (method_name, *args) is (method_name, a, b, c).
         # `pickle.dumps` converts Python object into binary data.
-        data = pickle.dumps((method_name, *args))
+        data = pickle.dumps(self._build_worker_message(method_name, args))
         n = len(data)
+        if n+4 > len(self.shm.buf):
+            raise ValueError(
+                "TP worker shared-memory payload is too large "
+                f"({n} bytes, capacity {len(self.shm.buf)-4} bytes). "
+                "Reduce max_num_batched_tokens, sequence lengths, or increase "
+                "the shared-memory segment size."
+            )
         # Data structure in shared memory:
         # First 4 bytes store the length of data.
         # Next `n` bytes store the pickled data.
@@ -135,6 +165,7 @@ class ModelRunner:
     
     def call(self, method_name: str, *args: dict):
         """ Call a method of the model. It will be used by both rank == 0 and rank != 0. """
+        self._activate_device()
         
         # (1) Rank 0 writes method name and args into shared memory.
         if self.world_size > 1 and self.rank == 0:
@@ -145,16 +176,27 @@ class ModelRunner:
             return method(*args)
         else:
             raise ValueError(f"Unknown method: {method_name}")
+
+    def run_worker_state(self, seq_states: list[dict], is_prefill: bool) -> list[int]:
+        seqs = [Sequence.from_worker_state(state) for state in seq_states]
+        return self.run(seqs, is_prefill)
     
     def exit(self):
+        if getattr(self, '_exited', False):
+            return
+        self._exited = True
+
         # Close shared memory.
-        if self.world_size > 1:
+        if self.world_size > 1 and hasattr(self, 'shm'):
             self.shm.close()
             if self.rank == 0:
-                self.shm.unlink()
+                try:
+                    self.shm.unlink()
+                except FileNotFoundError:
+                    pass
         
         # Delete CUDA graphs.
-        if not self.enforce_eager:
+        if not self.enforce_eager and hasattr(self, 'graphs'):
             del self.graphs, self.graph_vars, self.graph_pool
         torch.cuda.synchronize()
         
@@ -209,8 +251,18 @@ class ModelRunner:
         
         # ===== (2) Compute kv cache block size and number of available blocks. =====
         num_layers = self.config.hf_config.num_hidden_layers
-        num_kv_heads = self.config.hf_config.num_key_value_heads//self.world_size
+        total_num_kv_heads = self.config.hf_config.num_key_value_heads
+        if total_num_kv_heads is None:
+            total_num_kv_heads = self.config.hf_config.num_attention_heads
+        num_kv_heads = self._checked_local_tp_dimension(
+            field_name="num_key_value_heads",
+            value=total_num_kv_heads,
+            local_name="local KV heads",
+            extra="KV-head replication is not supported by baby-vllm-basic-online.",
+        )
         head_dim = self.config.hf_config.head_dim
+        if head_dim is None:
+            head_dim = self.config.hf_config.hidden_size//self.config.hf_config.num_attention_heads
         # size of one kv cache block in bytes
         # "*2" because we need to store both key and value.
         block_size_bytes = self.block_size*2*num_layers*num_kv_heads*head_dim*self.default_dtype.itemsize
@@ -220,7 +272,7 @@ class ModelRunner:
         # ===== (3) Allocate memory for kv cache. =====
         # Although `allocated_kv_cache` is a local variable, it will not be deleted out of the function,
         # because it will be referred by kv cache variables in model layers.
-        allocated_kv_cache = torch.empty(2, num_layers, self.config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim, device=f'cuda:{self.rank}')
+        allocated_kv_cache = torch.empty(2, num_layers, self.config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim, device=f'cuda:{self.device_id}')
 
         # ===== (4) Divide the giant kv cache pool into blocks and assign blocks to layers in model. =====
         layer_id = 0
@@ -230,6 +282,30 @@ class ModelRunner:
                 module.k_cache = allocated_kv_cache[0, layer_id]
                 module.v_cache = allocated_kv_cache[1, layer_id]
                 layer_id += 1
+
+    def _checked_local_tp_dimension(
+        self,
+        *,
+        field_name: str,
+        value: int,
+        local_name: str,
+        extra: str | None = None,
+    ) -> int:
+        if value % self.world_size != 0:
+            message = (
+                f"{field_name}={value} must be divisible by "
+                f"tensor_parallel_size={self.world_size}."
+            )
+            if extra is not None:
+                message = f"{message} {extra}"
+            raise ValueError(message)
+        local_value = value//self.world_size
+        if local_value <= 0:
+            raise ValueError(
+                f"tensor_parallel_size={self.world_size} produces zero {local_name} "
+                f"from {field_name}={value}."
+            )
+        return local_value
     
     @torch.inference_mode()
     def capture_cudagraph(self):
@@ -239,12 +315,12 @@ class ModelRunner:
         
         # Create fake inputs for capturing CUDA graph with maximum batch size and maximum sequence length.
         # In decode phase, input is a single token id for each sequence, so the shape is always (batch_size,).
-        input_ids = torch.zeros(max_bs, dtype=torch.int64, device=f'cuda:{self.rank}')
-        positions = torch.zeros(max_bs, dtype=torch.int64, device=f'cuda:{self.rank}')
-        slot_mapping = torch.zeros(max_bs, dtype=torch.int32, device=f'cuda:{self.rank}')
-        context_lens = torch.zeros(max_bs, dtype=torch.int32, device=f'cuda:{self.rank}')
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=f'cuda:{self.rank}')
-        outputs = torch.zeros(max_bs, self.config.hf_config.hidden_size, device=f'cuda:{self.rank}')
+        input_ids = torch.zeros(max_bs, dtype=torch.int64, device=f'cuda:{self.device_id}')
+        positions = torch.zeros(max_bs, dtype=torch.int64, device=f'cuda:{self.device_id}')
+        slot_mapping = torch.zeros(max_bs, dtype=torch.int32, device=f'cuda:{self.device_id}')
+        context_lens = torch.zeros(max_bs, dtype=torch.int32, device=f'cuda:{self.device_id}')
+        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=f'cuda:{self.device_id}')
+        outputs = torch.zeros(max_bs, self.config.hf_config.hidden_size, device=f'cuda:{self.device_id}')
         
         # Which batch sizes we want to capture CUDA graph for.
         self.graph_batch_sizes = [1, 2, 4, 8]+list(range(16,max_bs+1, 16))
@@ -327,11 +403,12 @@ class ModelRunner:
         for seq in seqs:
             token_ids = seq.token_ids
             num_cached_tokens = seq.num_cached_tokens
+            num_uncached_tokens = seq.validate_prefill_state()
             # Combining seperate sequences into a long sequence,
             # which enables efficient processing with variable length sequences.
             input_ids.extend(token_ids[num_cached_tokens:])
             positions.extend(list(range(num_cached_tokens, len(seq))))
-            seqlens_q.append(len(token_ids)-num_cached_tokens)
+            seqlens_q.append(num_uncached_tokens)
             seqlens_k.append(len(token_ids))
             cu_seqlens_q.append(cu_seqlens_q[-1]+seqlens_q[-1])
             cu_seqlens_k.append(cu_seqlens_k[-1]+seqlens_k[-1])
@@ -352,17 +429,47 @@ class ModelRunner:
                 block_tables.append(aligned_block_table)
         
         # Allocate input token ids to pinned memory buffer, accelerating data transfer between host and device.
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        input_ids = torch.tensor(
+            input_ids,
+            dtype=torch.int64,
+            device='cpu',
+            pin_memory=True,
+        ).cuda(self.device_id, non_blocking=True)
+        positions = torch.tensor(
+            positions,
+            dtype=torch.int64,
+            device='cpu',
+            pin_memory=True,
+        ).cuda(self.device_id, non_blocking=True)
         
         set_context(
             is_prefill=True,
-            cu_seqlens_q=torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-            cu_seqlens_k=torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            cu_seqlens_q=torch.tensor(
+                cu_seqlens_q,
+                dtype=torch.int32,
+                device='cpu',
+                pin_memory=True,
+            ).cuda(self.device_id, non_blocking=True),
+            cu_seqlens_k=torch.tensor(
+                cu_seqlens_k,
+                dtype=torch.int32,
+                device='cpu',
+                pin_memory=True,
+            ).cuda(self.device_id, non_blocking=True),
             max_seqlen_q=max(seqlens_q),
             max_seqlen_k=max(seqlens_k),
-            slot_mapping=torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-            block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
+            slot_mapping=torch.tensor(
+                slot_mapping,
+                dtype=torch.int32,
+                device='cpu',
+                pin_memory=True,
+            ).cuda(self.device_id, non_blocking=True),
+            block_tables=torch.tensor(
+                block_tables,
+                dtype=torch.int32,
+                device='cpu',
+                pin_memory=True,
+            ).cuda(self.device_id, non_blocking=True) if block_tables else None,
             context_lens=None,
         )
         
@@ -391,8 +498,18 @@ class ModelRunner:
             aligned_block_table = seq.block_table+[-1]*(max_num_blocks-len(seq.block_table))
             block_tables.append(aligned_block_table)
 
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        input_ids = torch.tensor(
+            input_ids,
+            dtype=torch.int64,
+            device='cpu',
+            pin_memory=True,
+        ).cuda(self.device_id, non_blocking=True)
+        positions = torch.tensor(
+            positions,
+            dtype=torch.int64,
+            device='cpu',
+            pin_memory=True,
+        ).cuda(self.device_id, non_blocking=True)
         
         set_context(
             is_prefill=False,
@@ -400,9 +517,24 @@ class ModelRunner:
             cu_seqlens_k=None,
             max_seqlen_q=0,
             max_seqlen_k=0,
-            slot_mapping=torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-            block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
-            context_lens=torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            slot_mapping=torch.tensor(
+                slot_mapping,
+                dtype=torch.int32,
+                device='cpu',
+                pin_memory=True,
+            ).cuda(self.device_id, non_blocking=True),
+            block_tables=torch.tensor(
+                block_tables,
+                dtype=torch.int32,
+                device='cpu',
+                pin_memory=True,
+            ).cuda(self.device_id, non_blocking=True) if block_tables else None,
+            context_lens=torch.tensor(
+                context_lens,
+                dtype=torch.int32,
+                device='cpu',
+                pin_memory=True,
+            ).cuda(self.device_id, non_blocking=True),
         )
         
         return input_ids, positions
@@ -413,7 +545,12 @@ class ModelRunner:
         temperatures = []
         for seq in seqs:
             temperatures.append(seq.temperature)
-        temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+        temperatures = torch.tensor(
+            temperatures,
+            dtype=torch.float32,
+            device='cpu',
+            pin_memory=True,
+        ).cuda(self.device_id, non_blocking=True)
         return temperatures
     
     @torch.inference_mode()

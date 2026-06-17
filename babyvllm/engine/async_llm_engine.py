@@ -77,16 +77,120 @@ Architecture Overview (Data Flow + Control Flow)
 
 """
 
+from __future__ import annotations
+
+import atexit
 import asyncio
 import itertools
 import time
+import traceback
+from dataclasses import fields
+from multiprocessing.connection import Connection
 from typing import AsyncGenerator, Optional, Union
 
+import torch.multiprocessing as mp
+from transformers import AutoTokenizer
+
+from babyvllm.config import Config
 from babyvllm.engine.llm_engine import LLMEngine
-from babyvllm.engine.request_tracker import RequestTracker
+from babyvllm.engine.request_tracker import AsyncStream, RequestTracker
 from babyvllm.engine.outputs import RequestOutput
 from babyvllm.engine.sequence import Sequence
 from babyvllm.sampling_params import SamplingParams
+
+
+def _safe_connection_send(connection: Connection, message) -> None:
+    try:
+        connection.send(message)
+    except (BrokenPipeError, EOFError, OSError):
+        pass
+
+
+async def _data_parallel_worker_main(model: str, config_kwargs: dict, connection: Connection):
+    rank = config_kwargs.get("data_parallel_rank", 0)
+    engine = AsyncLLMEngine(model=model, **config_kwargs)
+    request_tasks: dict[int, asyncio.Task] = {}
+
+    async def run_request(request_id: int, prompt_token_ids: list[int], sampling_params: SamplingParams):
+        try:
+            async for output in engine.generate(
+                prompt_token_ids,
+                sampling_params,
+                request_id=request_id,
+            ):
+                _safe_connection_send(connection, ("output", request_id, rank, output))
+            _safe_connection_send(connection, ("done", request_id, rank))
+        except asyncio.CancelledError:
+            engine.abort(request_id)
+            _safe_connection_send(connection, ("done", request_id, rank))
+        except BaseException:
+            _safe_connection_send(connection, ("error", request_id, rank, traceback.format_exc()))
+        finally:
+            request_tasks.pop(request_id, None)
+
+    _safe_connection_send(connection, ("ready", rank))
+    loop = asyncio.get_running_loop()
+
+    try:
+        while True:
+            try:
+                message = await loop.run_in_executor(None, connection.recv)
+            except (EOFError, BrokenPipeError, OSError):
+                break
+
+            if not isinstance(message, tuple) or not message:
+                _safe_connection_send(connection, ("error", None, rank, "Malformed DP worker message."))
+                continue
+
+            command = message[0]
+            if command == "exit":
+                break
+            if command == "generate" and len(message) == 4:
+                _, request_id, prompt_token_ids, sampling_params = message
+                if request_id in request_tasks:
+                    _safe_connection_send(
+                        connection,
+                        ("error", request_id, rank, f"Duplicate request_id {request_id}."),
+                    )
+                    continue
+                request_tasks[request_id] = asyncio.create_task(
+                    run_request(request_id, prompt_token_ids, sampling_params)
+                )
+                continue
+            if command == "abort" and len(message) == 2:
+                _, request_id = message
+                engine.abort(request_id)
+                task = request_tasks.get(request_id)
+                if task is not None:
+                    task.cancel()
+                continue
+
+            _safe_connection_send(connection, ("error", None, rank, f"Unknown DP worker command: {command!r}"))
+    finally:
+        for task in tuple(request_tasks.values()):
+            task.cancel()
+        if request_tasks:
+            await asyncio.gather(*request_tasks.values(), return_exceptions=True)
+        await engine.stop()
+        if getattr(engine, "engine", None) is not None:
+            engine.engine.exit()
+
+
+def data_parallel_worker_process(model: str, config_kwargs: dict, connection: Connection):
+    """Run one full online engine replica for a DP rank."""
+    import os
+    import sys
+
+    sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)
+    sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', buffering=1)
+
+    rank = config_kwargs.get("data_parallel_rank", 0)
+    try:
+        asyncio.run(_data_parallel_worker_main(model, config_kwargs, connection))
+    except BaseException:
+        _safe_connection_send(connection, ("error", None, rank, traceback.format_exc()))
+    finally:
+        connection.close()
 
 
 class AsyncLLMEngine:
@@ -160,19 +264,58 @@ class AsyncLLMEngine:
         #   - Model loading + multi-process Worker (ModelRunner via multiprocessing.spawn)
         #   - Tokenizer (HuggingFace AutoTokenizer: encode / decode)
         #   - Scheduler (sequence scheduling + KV Cache Block allocation)
+        self._is_data_parallel_coordinator = False
+        self._exited = False
+        self._model = model
+        self._config_kwargs: dict = {}
+
         if engine is not None:
+            if (
+                getattr(engine, "_is_data_parallel_coordinator", False)
+                or getattr(engine.config, "data_parallel_size", 1) > 1
+            ):
+                raise ValueError(
+                    "AsyncLLMEngine(engine=...) requires a single-replica "
+                    "LLMEngine. Offline DP coordinators cannot be used as the "
+                    "online execution engine."
+                )
             self.engine = engine
+            self.config = engine.config
+            self.tokenizer = self.engine.tokenizer
         elif model is not None:
-            self.engine = LLMEngine(model, **kwargs)
+            config_fields = {field.name for field in fields(Config)}
+            config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
+            requested_dp = config_kwargs.get("data_parallel_size", 1)
+            if (
+                isinstance(requested_dp, int)
+                and not isinstance(requested_dp, bool)
+                and requested_dp > 1
+            ):
+                self.config = Config(model, **config_kwargs)
+                self.engine = None
+                self.tokenizer = AutoTokenizer.from_pretrained(self.config.model)
+                self._is_data_parallel_coordinator = True
+                self._model = model
+                self._config_kwargs = {
+                    field.name: getattr(self.config, field.name)
+                    for field in fields(Config)
+                    if field.name not in {"model", "hf_config", "num_kvcache_blocks"}
+                }
+                self._data_parallel_reader_tasks = []
+                self._data_parallel_request_streams = {}
+                self._data_parallel_request_to_rank = {}
+                self._data_parallel_next_rank = 0
+                self._live_data_parallel_ranks = set()
+                self._init_data_parallel_workers()
+                atexit.register(self.exit)
+            else:
+                self.engine = LLMEngine(model, **kwargs)
+                self.config = self.engine.config
+                self.tokenizer = self.engine.tokenizer
         else:
             raise ValueError(
                 "Either `model` or `engine` must be provided to AsyncLLMEngine."
             )
-
-        # (2) Convenient Tokenizer Reference
-        # engine.tokenizer returns HuggingFace AutoTokenizer instance.
-        # Provides convenient reference to avoid repeated self.engine.tokenizer calls.
-        self.tokenizer = self.engine.tokenizer
 
         # (3) Request Tracker
         # RequestTracker is the request "router".
@@ -226,6 +369,279 @@ class AsyncLLMEngine:
         # Uses asyncio.Event instead of threading.Event (entire control flow is in asyncio).
         self._stop_event = asyncio.Event()
 
+        self._data_parallel_reader_tasks: list[asyncio.Task] = []
+        self._data_parallel_request_streams: dict[int, AsyncStream] = {}
+        self._data_parallel_request_to_rank: dict[int, int] = {}
+        self._data_parallel_next_rank = 0
+        self._live_data_parallel_ranks: set[int] = (
+            set(range(self.config.data_parallel_size))
+            if self._is_data_parallel_coordinator
+            else set()
+        )
+
+    def _worker_config_kwargs(self, rank: int) -> dict:
+        config_kwargs = dict(self._config_kwargs)
+        config_kwargs.update(
+            data_parallel_size=1,
+            data_parallel_world_size=self.config.effective_data_parallel_size,
+            data_parallel_rank=rank,
+            distributed_init_method=None,
+            shared_memory_name=None,
+            num_kvcache_blocks=-1,
+        )
+        return config_kwargs
+
+    def _init_data_parallel_workers(self):
+        ctx = mp.get_context("spawn")
+        self.dp_processes = []
+        self.dp_connections = []
+        self._live_data_parallel_ranks = set(range(self.config.data_parallel_size))
+
+        for rank in range(self.config.data_parallel_size):
+            parent_conn, child_conn = ctx.Pipe()
+            process = ctx.Process(
+                target=data_parallel_worker_process,
+                args=(self._model, self._worker_config_kwargs(rank), child_conn),
+                name=f"babyvllm_online_dp_rank_{rank}",
+            )
+            process.start()
+            child_conn.close()
+            self.dp_processes.append(process)
+            self.dp_connections.append(parent_conn)
+
+        try:
+            for rank in range(self.config.data_parallel_size):
+                self._wait_for_data_parallel_worker_ready(rank)
+        except BaseException:
+            self.exit()
+            raise
+
+    def _recv_data_parallel_message(self, rank: int, request_id: int | None):
+        connection = self.dp_connections[rank]
+        process = self.dp_processes[rank]
+        while True:
+            if connection.poll(0.1):
+                return connection.recv()
+            if not process.is_alive():
+                suffix = "" if request_id is None else f" for request {request_id}"
+                raise RuntimeError(f"DP rank {rank} exited unexpectedly{suffix}.")
+
+    def _wait_for_data_parallel_worker_ready(self, rank: int):
+        message = self._recv_data_parallel_message(rank, request_id=None)
+        if message == ("ready", rank):
+            return
+        if isinstance(message, tuple) and message and message[0] == "error":
+            _, request_id, error_rank, error_text = message
+            raise RuntimeError(
+                f"DP rank {error_rank} failed during startup"
+                f"{'' if request_id is None else f' for request {request_id}'}:\n{error_text}"
+            )
+        raise RuntimeError(f"Malformed ready message from DP rank {rank}: {message!r}")
+
+    def _ensure_data_parallel_reader_tasks(self):
+        if not self._is_data_parallel_coordinator:
+            return
+        if self._exited:
+            raise RuntimeError("AsyncLLMEngine DP coordinator has already exited.")
+        if any(not task.done() for task in self._data_parallel_reader_tasks):
+            return
+        self._data_parallel_reader_tasks = [
+            asyncio.create_task(self._data_parallel_reader_loop(rank))
+            for rank in sorted(self._live_data_parallel_ranks)
+        ]
+
+    async def _data_parallel_reader_loop(self, rank: int):
+        connection = self.dp_connections[rank]
+        loop = asyncio.get_running_loop()
+        while not self._exited and rank in self._live_data_parallel_ranks:
+            try:
+                message = await loop.run_in_executor(None, connection.recv)
+            except (EOFError, BrokenPipeError, OSError):
+                if not self._exited:
+                    self._fail_data_parallel_rank(
+                        rank,
+                        RuntimeError(f"DP rank {rank} connection closed unexpectedly."),
+                    )
+                break
+            self._handle_data_parallel_message(rank, message)
+
+    def _handle_data_parallel_message(self, rank: int, message):
+        if not isinstance(message, tuple) or not message:
+            self._fail_data_parallel_rank(
+                rank,
+                RuntimeError(f"Malformed message from DP rank {rank}: {message!r}"),
+            )
+            return
+
+        command = message[0]
+        if command == "output" and len(message) == 4:
+            _, request_id, worker_rank, output = message
+            if worker_rank != rank:
+                self._fail_data_parallel_request(
+                    request_id,
+                    RuntimeError(f"DP rank mismatch: reader={rank}, worker={worker_rank}."),
+                )
+                return
+            stream = self._data_parallel_request_streams.get(request_id)
+            if stream is not None:
+                stream.put(output)
+            return
+
+        if command == "done" and len(message) == 3:
+            _, request_id, worker_rank = message
+            if worker_rank != rank:
+                self._fail_data_parallel_request(
+                    request_id,
+                    RuntimeError(f"DP rank mismatch: reader={rank}, worker={worker_rank}."),
+                )
+                return
+            self._finish_data_parallel_request(request_id)
+            return
+
+        if command == "error" and len(message) == 4:
+            _, request_id, worker_rank, error_text = message
+            error = RuntimeError(f"DP rank {worker_rank} failed: {error_text}")
+            if request_id is None:
+                self._fail_data_parallel_rank(worker_rank, error)
+            else:
+                self._fail_data_parallel_request(request_id, error)
+            return
+
+        self._fail_data_parallel_rank(
+            rank,
+            RuntimeError(f"Unknown message from DP rank {rank}: {message!r}"),
+        )
+
+    def _finish_data_parallel_request(self, request_id: int):
+        stream = self._data_parallel_request_streams.pop(request_id, None)
+        self._data_parallel_request_to_rank.pop(request_id, None)
+        self._prompt_map.pop(request_id, None)
+        self._request_timings.pop(request_id, None)
+        if stream is not None:
+            stream.finish()
+
+    def _fail_data_parallel_request(self, request_id: int, exception: BaseException):
+        stream = self._data_parallel_request_streams.pop(request_id, None)
+        self._data_parallel_request_to_rank.pop(request_id, None)
+        self._prompt_map.pop(request_id, None)
+        self._request_timings.pop(request_id, None)
+        if stream is not None:
+            stream.finish(exception=exception)
+
+    def _fail_data_parallel_rank(self, rank: int, exception: BaseException):
+        self._live_data_parallel_ranks.discard(rank)
+        owned_request_ids = [
+            request_id
+            for request_id, owner_rank in self._data_parallel_request_to_rank.items()
+            if owner_rank == rank
+        ]
+        for request_id in owned_request_ids:
+            self._fail_data_parallel_request(request_id, exception)
+
+    def _select_data_parallel_rank(self) -> int:
+        live_ranks = sorted(self._live_data_parallel_ranks)
+        if not live_ranks:
+            raise RuntimeError("No live DP ranks are available for routing.")
+        rank = live_ranks[self._data_parallel_next_rank % len(live_ranks)]
+        self._data_parallel_next_rank += 1
+        return rank
+
+    def _add_data_parallel_request(
+        self,
+        sampling_params: SamplingParams,
+        prompt: Optional[str] = None,
+        prompt_token_ids: Optional[list[int]] = None,
+        request_id: Optional[int] = None,
+    ) -> tuple[AsyncStream, int]:
+        if prompt_token_ids is None:
+            if prompt is None:
+                raise ValueError("Either prompt or prompt_token_ids must be provided.")
+            prompt_token_ids = self.tokenizer.encode(prompt)
+
+        if request_id is None:
+            request_id = next(self._request_counter)
+        if (
+            request_id in self._data_parallel_request_streams
+            or request_id in self._data_parallel_request_to_rank
+        ):
+            raise KeyError(f"Request {request_id} already exists.")
+
+        self._ensure_data_parallel_reader_tasks()
+        rank = self._select_data_parallel_rank()
+        stream = AsyncStream(request_id, cancel=lambda rid: self.abort(rid))
+        self._data_parallel_request_streams[request_id] = stream
+        self._data_parallel_request_to_rank[request_id] = rank
+        self._prompt_map[request_id] = prompt_token_ids
+        self._request_timings[request_id] = {"arrival_time": time.time()}
+
+        try:
+            self.dp_connections[rank].send(("generate", request_id, prompt_token_ids, sampling_params))
+        except (BrokenPipeError, EOFError, OSError) as exc:
+            self._fail_data_parallel_rank(
+                rank,
+                RuntimeError(f"DP rank {rank} connection failed while routing request {request_id}: {exc}"),
+            )
+        return stream, request_id
+
+    def _abort_data_parallel_request(self, request_id: int) -> None:
+        rank = self._data_parallel_request_to_rank.pop(request_id, None)
+        stream = self._data_parallel_request_streams.pop(request_id, None)
+        self._prompt_map.pop(request_id, None)
+        self._request_timings.pop(request_id, None)
+        if stream is not None:
+            stream.finish(exception=asyncio.CancelledError())
+        if rank is None or rank not in self._live_data_parallel_ranks:
+            return
+        try:
+            self.dp_connections[rank].send(("abort", request_id))
+        except (BrokenPipeError, EOFError, OSError):
+            self._fail_data_parallel_rank(
+                rank,
+                RuntimeError(f"DP rank {rank} connection failed while aborting request {request_id}."),
+            )
+
+    def _shutdown_data_parallel_workers(self):
+        for stream in list(getattr(self, "_data_parallel_request_streams", {}).values()):
+            stream.finish(exception=asyncio.CancelledError())
+        self._data_parallel_request_streams.clear()
+        self._data_parallel_request_to_rank.clear()
+
+        for connection, process in zip(
+            getattr(self, 'dp_connections', []),
+            getattr(self, 'dp_processes', []),
+        ):
+            if process.is_alive():
+                try:
+                    connection.send(("exit",))
+                except (BrokenPipeError, EOFError, OSError):
+                    pass
+
+        for connection, process in zip(
+            getattr(self, 'dp_connections', []),
+            getattr(self, 'dp_processes', []),
+        ):
+            process.join(timeout=5)
+            if process.is_alive():
+                process.terminate()
+                process.join()
+            try:
+                connection.close()
+            except OSError:
+                pass
+
+        self.dp_processes = []
+        self.dp_connections = []
+        self._live_data_parallel_ranks.clear()
+
+    def exit(self):
+        if self._exited:
+            return
+        self._exited = True
+        if self._is_data_parallel_coordinator:
+            self._shutdown_data_parallel_workers()
+        elif getattr(self, "engine", None) is not None:
+            self.engine.exit()
+
     @property
     def engine_started(self) -> bool:
         """
@@ -242,6 +658,8 @@ class AsyncLLMEngine:
             # ... after first generate() call ...
             assert engine.engine_started      # Background loop started
         """
+        if self._is_data_parallel_coordinator:
+            return any(not task.done() for task in self._data_parallel_reader_tasks)
         return self._engine_task is not None and not self._engine_task.done()
 
     # =========================================================================
@@ -253,6 +671,7 @@ class AsyncLLMEngine:
         sampling_params: SamplingParams,
         prompt: Optional[str] = None,
         prompt_token_ids: Optional[list[int]] = None,
+        request_id: Optional[int] = None,
     ) -> tuple:
         """
         Register a new inference request (synchronous method, called by API layer / generate()).
@@ -314,6 +733,14 @@ class AsyncLLMEngine:
                 print(output.text)
         """
 
+        if self._is_data_parallel_coordinator:
+            return self._add_data_parallel_request(
+                sampling_params=sampling_params,
+                prompt=prompt,
+                prompt_token_ids=prompt_token_ids,
+                request_id=request_id,
+            )
+
         # (1) Tokenize: Convert string to token_ids if provided.
         #     Uses self.tokenizer (HuggingFace AutoTokenizer) for encoding.
         #     Why tokenize in add_request instead of _engine_step?
@@ -330,7 +757,8 @@ class AsyncLLMEngine:
         # (2) Generate unique request_id.
         #     Uses self._request_counter (itertools.count) for auto-increment.
         #     This is AsyncLLMEngine-level ID, completely independent of Sequence.seq_id.
-        request_id = next(self._request_counter)
+        if request_id is None:
+            request_id = next(self._request_counter)
 
         # (3) Store prompt_token_ids in _prompt_map.
         #     Later in output routing phase of _engine_step(),
@@ -788,7 +1216,33 @@ class AsyncLLMEngine:
                     worker("Question 2", 2),
                     worker("Question 3", 3),
                 )
-        """
+        """ 
+
+        if self._is_data_parallel_coordinator:
+            if isinstance(prompt, str):
+                stream, rid = self.add_request(
+                    sampling_params=sampling_params,
+                    prompt=prompt,
+                    request_id=request_id,
+                )
+            elif isinstance(prompt, list):
+                stream, rid = self.add_request(
+                    sampling_params=sampling_params,
+                    prompt_token_ids=prompt,
+                    request_id=request_id,
+                )
+            else:
+                raise ValueError(
+                    f"prompt must be str or list[int], got {type(prompt)}."
+                )
+
+            iterator = stream.generator()
+            try:
+                async for output in iterator:
+                    yield output
+            finally:
+                await iterator.aclose()
+            return
 
         # (1) Lazy startup of background loop
         # Create background Task only on first generate() call.
@@ -825,11 +1279,13 @@ class AsyncLLMEngine:
             stream, rid = self.add_request(
                 sampling_params=sampling_params,
                 prompt=prompt,
+                request_id=request_id,
             )
         elif isinstance(prompt, list):
             stream, rid = self.add_request(
                 sampling_params=sampling_params,
                 prompt_token_ids=prompt,
+                request_id=request_id,
             )
         else:
             raise ValueError(
@@ -883,6 +1339,10 @@ class AsyncLLMEngine:
             # → scheduler frees KV cache blocks
             # → internal mappings cleaned up
         """
+        if self._is_data_parallel_coordinator:
+            self._abort_data_parallel_request(request_id)
+            return
+
         # (1) Tracker cleanup: finishes stream, puts request_id in _aborted_requests.
         #     The stream consumer (async for loop in API layer) will receive
         #     a CancelledError when it reads from the queue.
@@ -956,6 +1416,15 @@ class AsyncLLMEngine:
           - After stop(), calling generate() again will auto-restart (lazy startup)
           - If there are incomplete requests, their streams are cleaned up by RequestTracker.abort_request()
         """
+
+        if self._is_data_parallel_coordinator:
+            self.exit()
+            for task in self._data_parallel_reader_tasks:
+                task.cancel()
+            if self._data_parallel_reader_tasks:
+                await asyncio.gather(*self._data_parallel_reader_tasks, return_exceptions=True)
+            self._data_parallel_reader_tasks = []
+            return
 
         # If background loop never started, nothing to stop
         if self._engine_task is None:

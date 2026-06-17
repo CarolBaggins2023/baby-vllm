@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import xxhash
 from collections import deque
 import numpy as np

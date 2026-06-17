@@ -17,10 +17,13 @@ Usage:
     python online_bench.py --model /path/to/model --mode http --base-url http://localhost:8000
 """
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 import json
 import random
+import sys
 import time
 from dataclasses import dataclass
 from random import randint, seed as py_seed
@@ -84,8 +87,11 @@ class AggregateMetrics:
 
 def generate_random_test_data(
     num_requests: int,
+    min_input_len: int,
     max_input_len: int,
+    min_output_len: int,
     max_output_len: int,
+    vocab_size: int,
     seed_val: int = 42,
 ) -> tuple:
     """
@@ -93,8 +99,8 @@ def generate_random_test_data(
 
     Mirrors the data generation pattern in bench.py:
       - Fixed random seed for reproducibility
-      - Random prompt token IDs with varying lengths (100 to max_input_len)
-      - Random SamplingParams with varying max_tokens (100 to max_output_len), ignore_eos=True
+      - Random prompt token IDs with varying lengths
+      - Random SamplingParams with varying max_tokens, ignore_eos=True
 
     Returns:
         (prompt_token_ids_list, sampling_params_list): tuple of two lists.
@@ -104,18 +110,85 @@ def generate_random_test_data(
     py_seed(seed_val)
 
     prompt_token_ids = [
-        [randint(0, 10000) for _ in range(randint(100, max_input_len))]
+        [
+            randint(0, vocab_size - 1)
+            for _ in range(randint(min_input_len, max_input_len))
+        ]
         for _ in range(num_requests)
     ]
     sampling_params = [
         SamplingParams(
             temperature=0.6,
             ignore_eos=True,
-            max_tokens=randint(100, max_output_len),
+            max_tokens=randint(min_output_len, max_output_len),
         )
         for _ in range(num_requests)
     ]
     return prompt_token_ids, sampling_params
+
+
+def _parse_int_csv(value: str, flag_name: str) -> list[int]:
+    try:
+        return [int(part.strip()) for part in value.split(",") if part.strip()]
+    except ValueError as exc:
+        raise ValueError(f"{flag_name} must be a comma-separated list of integers.") from exc
+
+
+def parse_nonnegative_int_csv(value: str, flag_name: str) -> list[int]:
+    values = _parse_int_csv(value, flag_name)
+    if not values:
+        raise ValueError(f"{flag_name} must include at least one value.")
+    if any(item < 0 for item in values):
+        raise ValueError(f"{flag_name} values must be non-negative integers.")
+    if len(set(values)) != len(values):
+        raise ValueError(f"{flag_name} values must be unique.")
+    return values
+
+
+def required_cuda_devices(dp_size: int, tp_size: int) -> int:
+    return dp_size * tp_size
+
+
+def select_device_ids(
+    device_ids: Optional[list[int]],
+    *,
+    dp_size: int,
+    tp_size: int,
+) -> Optional[list[int]]:
+    if device_ids is None:
+        return None
+    required = required_cuda_devices(dp_size, tp_size)
+    if len(device_ids) < required:
+        raise ValueError(
+            f"--device-ids must include at least {required} ids for "
+            f"data_parallel_size={dp_size} and tensor_parallel_size={tp_size}."
+        )
+    return list(device_ids[:required])
+
+
+def preflight_cuda_devices(
+    *,
+    dp_size: int,
+    tp_size: int,
+    device_ids: Optional[list[int]] = None,
+) -> None:
+    visible = torch.cuda.device_count()
+    required = required_cuda_devices(dp_size, tp_size)
+    if visible < required:
+        raise ValueError(
+            "data_parallel_size*tensor_parallel_size requires "
+            f"{required} CUDA devices, but only {visible} are visible."
+        )
+    selected_device_ids = select_device_ids(
+        device_ids,
+        dp_size=dp_size,
+        tp_size=tp_size,
+    )
+    if selected_device_ids and max(selected_device_ids) >= visible:
+        raise ValueError(
+            f"--device-ids references cuda:{max(selected_device_ids)}, "
+            f"but only {visible} CUDA devices are visible."
+        )
 
 
 # ===========================================================================
@@ -195,6 +268,8 @@ def print_report(config: argparse.Namespace, agg: AggregateMetrics) -> None:
     print(f" Total Requests        : {agg.num_requests} "
           f"({agg.num_success} success, {agg.num_failed} failed)")
     print(f" Concurrency           : {config.concurrency}")
+    print(f" Data Parallel Size    : {config.data_parallel_size}")
+    print(f" Tensor Parallel Size  : {config.tensor_parallel_size}")
     print(f" Streaming             : {config.stream}")
     print(f" Arrival Pattern       : {config.arrival_pattern}")
     if config.arrival_pattern == "batch":
@@ -255,9 +330,18 @@ def export_json(
             "num_requests": agg.num_requests,
             "concurrency": getattr(config, "concurrency", 0),
             "stream": getattr(config, "stream", True),
+            "data_parallel_size": getattr(config, "data_parallel_size", 1),
+            "tensor_parallel_size": getattr(config, "tensor_parallel_size", 1),
+            "device_ids": getattr(config, "device_ids", None),
+            "server_embedded": getattr(config, "server_embedded", False),
             "arrival_pattern": getattr(config, "arrival_pattern", "batch"),
             "batch_size": getattr(config, "batch_size", 32),
             "batch_interval": getattr(config, "batch_interval", 5.0),
+            "min_input_len": getattr(config, "min_input_len", 16),
+            "max_input_len": getattr(config, "max_input_len", 1024),
+            "min_output_len": getattr(config, "min_output_len", 8),
+            "max_output_len": getattr(config, "max_output_len", 1024),
+            "vocab_size": getattr(config, "vocab_size", 10000),
         },
         "aggregate": {
             "num_requests": agg.num_requests,
@@ -524,6 +608,8 @@ class DirectEngineRunner:
         self._verbose = verbose
         self._semaphore = asyncio.Semaphore(concurrency)
         self._engine = None
+        self._dp_rank_assignments: list[int] = []
+        self._original_select_data_parallel_rank = None
 
     async def _create_engine(self) -> None:
         """Lazily create the AsyncLLMEngine."""
@@ -531,6 +617,50 @@ class DirectEngineRunner:
             from babyvllm.engine.async_llm_engine import AsyncLLMEngine
 
             self._engine = AsyncLLMEngine(model=self._model, **self._engine_kwargs)
+
+    def _install_dp_rank_recorder(self) -> None:
+        if self._engine is None:
+            return
+        if not getattr(self._engine, "_is_data_parallel_coordinator", False):
+            return
+        if self._original_select_data_parallel_rank is not None:
+            return
+
+        original = self._engine._select_data_parallel_rank
+        self._original_select_data_parallel_rank = original
+        self._dp_rank_assignments = []
+        if hasattr(self._engine, "_data_parallel_next_rank"):
+            self._engine._data_parallel_next_rank = 0
+
+        def wrapped_select_data_parallel_rank():
+            rank = original()
+            self._dp_rank_assignments.append(rank)
+            return rank
+
+        self._engine._select_data_parallel_rank = wrapped_select_data_parallel_rank
+
+    def _validate_dp_rank_distribution(self, num_requests: int) -> None:
+        if self._engine is None:
+            return
+        if not getattr(self._engine, "_is_data_parallel_coordinator", False):
+            return
+        expected_ranks = set(getattr(self._engine, "_live_data_parallel_ranks", set()))
+        if not expected_ranks:
+            expected_ranks = set(range(self._engine.config.data_parallel_size))
+        if num_requests < len(expected_ranks):
+            return
+
+        observed_ranks = set(self._dp_rank_assignments)
+        missing = sorted(expected_ranks-observed_ranks)
+        if missing:
+            raise AssertionError(
+                f"Online DP benchmark did not route requests to DP rank(s): {missing}."
+            )
+        counts = {
+            rank: self._dp_rank_assignments.count(rank)
+            for rank in sorted(observed_ranks)
+        }
+        print(f"Direct-mode DP rank assignments: {counts}")
 
     async def _run_single_request(
         self,
@@ -546,7 +676,11 @@ class DirectEngineRunner:
             final_output = None
 
             try:
-                gen = self._engine.generate(prompt_token_ids, sampling_params)
+                gen = self._engine.generate(
+                    prompt_token_ids,
+                    sampling_params,
+                    request_id=idx,
+                )
 
                 async def _consume():
                     nonlocal first_token_time, completion_time, final_output
@@ -560,6 +694,11 @@ class DirectEngineRunner:
                 await asyncio.wait_for(_consume(), timeout=self._timeout)
 
                 if final_output is not None:
+                    if final_output.request_id != idx:
+                        raise AssertionError(
+                            f"Request ID mismatch: submitted {idx}, "
+                            f"got {final_output.request_id}."
+                        )
                     # Extract metrics from RequestOutput fields
                     # (populated by AsyncLLMEngine when finished=True)
                     prompt_tokens = len(final_output.prompt_token_ids)
@@ -622,6 +761,8 @@ class DirectEngineRunner:
                     prompt_tokens=len(prompt_token_ids),
                     error_message=f"Timeout after {self._timeout:.1f}s",
                 )
+            except AssertionError:
+                raise
             except Exception as e:
                 if self._verbose:
                     print(f"  [{idx:4d}] ERROR   | {type(e).__name__}: {e}")
@@ -649,56 +790,67 @@ class DirectEngineRunner:
 
         await self._create_engine()
 
-        # Warmup: run a single request to compile CUDA graphs and allocate memory
-        from babyvllm import SamplingParams
+        try:
+            # Warmup: run a single request to compile CUDA graphs and allocate memory
+            from babyvllm import SamplingParams
 
-        print("Engine warming up (compile CUDA Graph, allocate memory)...")
-        async for _ in self._engine.generate(
-            [1, 2, 3], SamplingParams(max_tokens=8)
-        ):
-            pass
-        print("Warmup complete. Starting benchmark...\n")
+            print("Engine warming up (compile CUDA Graph, allocate memory)...")
+            async for _ in self._engine.generate(
+                [1, 2, 3], SamplingParams(max_tokens=8), request_id=-1
+            ):
+                pass
+            print("Warmup complete. Starting benchmark...\n")
 
-        wall_start = time.perf_counter()
+            self._install_dp_rank_recorder()
 
-        raw_results = await _launch_with_arrival(
-            self,
-            num_requests=num_requests,
-            prompt_token_ids_list=prompt_token_ids_list,
-            sampling_params_list=sampling_params_list,
-            arrival_pattern=arrival_pattern,
-            stagger_interval_sec=stagger_interval_sec,
-            rate_rps=rate_rps,
-            batch_size=batch_size,
-            batch_interval=batch_interval,
-            seed=seed,
-        )
+            wall_start = time.perf_counter()
 
-        wall_end = time.perf_counter()
+            raw_results = await _launch_with_arrival(
+                self,
+                num_requests=num_requests,
+                prompt_token_ids_list=prompt_token_ids_list,
+                sampling_params_list=sampling_params_list,
+                arrival_pattern=arrival_pattern,
+                stagger_interval_sec=stagger_interval_sec,
+                rate_rps=rate_rps,
+                batch_size=batch_size,
+                batch_interval=batch_interval,
+                seed=seed,
+            )
 
-        # Convert gather results (which may contain exceptions) to PerRequestMetrics
-        per_request_list = []
-        for i, result in enumerate(raw_results):
-            if isinstance(result, PerRequestMetrics):
-                per_request_list.append(result)
-            elif isinstance(result, Exception):
-                per_request_list.append(PerRequestMetrics(
-                    request_id=i,
-                    status="error",
-                    submit_time=0.0,
-                    prompt_tokens=len(prompt_token_ids_list[i]),
-                    error_message=f"Unhandled exception: {result}",
-                ))
-            else:
-                per_request_list.append(PerRequestMetrics(
-                    request_id=i,
-                    status="error",
-                    submit_time=0.0,
-                    prompt_tokens=len(prompt_token_ids_list[i]),
-                    error_message=f"Unexpected result type: {type(result)}",
-                ))
+            wall_end = time.perf_counter()
+            self._validate_dp_rank_distribution(num_requests)
 
-        return per_request_list, wall_start, wall_end
+            # Convert gather results (which may contain exceptions) to PerRequestMetrics
+            per_request_list = []
+            for i, result in enumerate(raw_results):
+                if isinstance(result, PerRequestMetrics):
+                    per_request_list.append(result)
+                elif isinstance(result, AssertionError):
+                    raise result
+                elif isinstance(result, Exception):
+                    per_request_list.append(PerRequestMetrics(
+                        request_id=i,
+                        status="error",
+                        submit_time=0.0,
+                        prompt_tokens=len(prompt_token_ids_list[i]),
+                        error_message=f"Unhandled exception: {result}",
+                    ))
+                else:
+                    per_request_list.append(PerRequestMetrics(
+                        request_id=i,
+                        status="error",
+                        submit_time=0.0,
+                        prompt_tokens=len(prompt_token_ids_list[i]),
+                        error_message=f"Unexpected result type: {type(result)}",
+                    ))
+
+            return per_request_list, wall_start, wall_end
+        finally:
+            if self._engine is not None:
+                await self._engine.stop()
+                if getattr(self._engine, "engine", None) is not None:
+                    self._engine.engine.exit()
 
 
 # ===========================================================================
@@ -1079,6 +1231,9 @@ Examples:
   # HTTP mode with embedded server
   python online_bench.py --model /path/to/model --mode http --server-embedded --port 8001
 
+  # Direct mode with online data parallelism
+  python online_bench.py --model /path/to/model --data-parallel-size 2 --tensor-parallel-size 1
+
   # Higher concurrency, burst pattern
   python online_bench.py --model /path/to/model --concurrency 64 --num-requests 512
 
@@ -1137,12 +1292,24 @@ Examples:
         help="Maximum concurrent requests. Default: 32.",
     )
     parser.add_argument(
+        "--min-input-len", type=int, default=16,
+        help="Minimum prompt tokens per request. Default: 16.",
+    )
+    parser.add_argument(
         "--max-input-len", type=int, default=1024,
         help="Maximum prompt tokens per request. Default: 1024.",
     )
     parser.add_argument(
+        "--min-output-len", type=int, default=8,
+        help="Minimum generated tokens per request. Default: 8.",
+    )
+    parser.add_argument(
         "--max-output-len", type=int, default=1024,
         help="Maximum generated tokens per request. Default: 1024.",
+    )
+    parser.add_argument(
+        "--vocab-size", type=int, default=10000,
+        help="Random token id range. Default: 10000.",
     )
     parser.add_argument(
         "--arrival-pattern", type=str, default="batch",
@@ -1187,6 +1354,14 @@ Examples:
         help="Number of tensor parallel replicas. Default: 1.",
     )
     parser.add_argument(
+        "--data-parallel-size", type=int, default=1,
+        help="Number of data parallel online replicas. Default: 1.",
+    )
+    parser.add_argument(
+        "--device-ids", type=str, default=None,
+        help="Optional comma-separated CUDA device ids for local direct or embedded-server engine creation.",
+    )
+    parser.add_argument(
         "--max-num-batched-tokens", type=int, default=4096,
         help="Maximum total tokens per batch. Default: 4096.",
     )
@@ -1217,12 +1392,48 @@ Examples:
         help="Random seed for reproducibility. Default: 42.",
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.device_ids is not None:
+        args.device_ids = parse_nonnegative_int_csv(args.device_ids, "--device-ids")
+    if args.num_requests <= 0:
+        raise ValueError("--num-requests must be positive.")
+    if args.concurrency <= 0:
+        raise ValueError("--concurrency must be positive.")
+    if args.min_input_len <= 0 or args.max_input_len <= 0:
+        raise ValueError("Input length bounds must be positive.")
+    if args.min_input_len > args.max_input_len:
+        raise ValueError("--min-input-len must be <= --max-input-len.")
+    if args.min_output_len <= 0 or args.max_output_len <= 0:
+        raise ValueError("Output length bounds must be positive.")
+    if args.min_output_len > args.max_output_len:
+        raise ValueError("--min-output-len must be <= --max-output-len.")
+    if args.vocab_size <= 0:
+        raise ValueError("--vocab-size must be positive.")
+    if args.tensor_parallel_size <= 0:
+        raise ValueError("--tensor-parallel-size must be positive.")
+    if args.data_parallel_size <= 0:
+        raise ValueError("--data-parallel-size must be positive.")
+    if args.mode == "http" and not args.server_embedded and args.device_ids is not None:
+        print("warning: --device-ids is ignored for external HTTP mode.", file=sys.stderr)
+    return args
 
 
 async def main() -> None:
     """Async main entry point: parse args, create runner, execute benchmark."""
     args = parse_args()
+    selected_device_ids = None
+    if args.mode == "direct" or (args.mode == "http" and args.server_embedded):
+        selected_device_ids = select_device_ids(
+            args.device_ids,
+            dp_size=args.data_parallel_size,
+            tp_size=args.tensor_parallel_size,
+        )
+        preflight_cuda_devices(
+            dp_size=args.data_parallel_size,
+            tp_size=args.tensor_parallel_size,
+            device_ids=selected_device_ids,
+        )
+        args.device_ids = selected_device_ids
 
     print("=" * 66)
     print(" baby-vllm Online Inference Benchmark")
@@ -1230,10 +1441,14 @@ async def main() -> None:
     print(f" Model            : {args.model}")
     print(f" Mode             : {args.mode}")
     print(f" Streaming        : {args.stream}")
+    print(f" Data Parallel    : {args.data_parallel_size}")
+    print(f" Tensor Parallel  : {args.tensor_parallel_size}")
+    if selected_device_ids is not None:
+        print(f" Device IDs       : {selected_device_ids}")
     print(f" Requests         : {args.num_requests}")
     print(f" Concurrency      : {args.concurrency}")
-    print(f" Max Input Len    : {args.max_input_len}")
-    print(f" Max Output Len   : {args.max_output_len}")
+    print(f" Input Len        : {args.min_input_len}..{args.max_input_len}")
+    print(f" Output Len       : {args.min_output_len}..{args.max_output_len}")
     print(f" Arrival Pattern  : {args.arrival_pattern}")
     if args.arrival_pattern == "batch":
         print(f" Batch Size       : {args.batch_size}")
@@ -1249,8 +1464,11 @@ async def main() -> None:
     # Generate test data
     prompt_token_ids_list, sampling_params_list = generate_random_test_data(
         num_requests=args.num_requests,
+        min_input_len=args.min_input_len,
         max_input_len=args.max_input_len,
+        min_output_len=args.min_output_len,
         max_output_len=args.max_output_len,
+        vocab_size=args.vocab_size,
         seed_val=args.seed,
     )
     total_prompt = sum(len(p) for p in prompt_token_ids_list)
@@ -1263,10 +1481,13 @@ async def main() -> None:
     engine_kwargs = {
         "enforce_eager": args.enforce_eager,
         "tensor_parallel_size": args.tensor_parallel_size,
+        "data_parallel_size": args.data_parallel_size,
         "max_num_batched_tokens": args.max_num_batched_tokens,
         "max_num_sequences": args.max_num_sequences,
         "gpu_memory_utilization": args.gpu_memory_utilization,
     }
+    if selected_device_ids is not None:
+        engine_kwargs["data_parallel_device_ids"] = selected_device_ids
 
     # Create runner
     if args.mode == "direct":
@@ -1346,4 +1567,8 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (AssertionError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2)

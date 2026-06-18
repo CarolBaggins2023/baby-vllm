@@ -144,7 +144,7 @@ def _get_model_name() -> str:
 
     # Try HuggingFace config's name_or_path first
     # hf_config is AutoConfig | None (from Config.__post_init__)
-    hf_config = _engine.engine.config.hf_config
+    hf_config = _engine.config.hf_config
     if hf_config is not None and hasattr(hf_config, "name_or_path") and hf_config.name_or_path:
         # name_or_path typically looks like "Qwen/Qwen2-0.5B-Instruct"
         # os.path.basename extracts "Qwen2-0.5B-Instruct"
@@ -154,7 +154,7 @@ def _get_model_name() -> str:
     # Fallback: use filesystem directory name
     # config.model is the raw path passed to --model CLI argument
     # rstrip("/\\") handles trailing slashes on Windows and Unix paths
-    _model_name = os.path.basename(_engine.engine.config.model.rstrip("/\\"))
+    _model_name = os.path.basename(_engine.config.model.rstrip("/\\"))
     return _model_name
 
 

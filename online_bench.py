@@ -17,6 +17,8 @@ Usage:
     python online_bench.py --model /path/to/model --mode http --base-url http://localhost:8000
 """
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 import json
@@ -127,8 +129,11 @@ def apply_scenario_preset(
 
 def generate_random_test_data(
     num_requests: int,
+    min_input_len: int,
     max_input_len: int,
+    min_output_len: int,
     max_output_len: int,
+    vocab_size: int,
     seed_val: int = 42,
 ) -> tuple:
     """
@@ -136,8 +141,8 @@ def generate_random_test_data(
 
     Mirrors the data generation pattern in offline_bench.py:
       - Fixed random seed for reproducibility
-      - Random prompt token IDs with varying lengths (100 to max_input_len)
-      - Random SamplingParams with varying max_tokens (100 to max_output_len), ignore_eos=True
+      - Random prompt token IDs with varying lengths
+      - Random SamplingParams with varying max_tokens, ignore_eos=True
 
     Returns:
         (prompt_token_ids_list, sampling_params_list): tuple of two lists.
@@ -147,18 +152,81 @@ def generate_random_test_data(
     py_seed(seed_val)
 
     prompt_token_ids = [
-        [randint(0, 10000) for _ in range(randint(100, max_input_len))]
+        [
+            randint(0, vocab_size - 1)
+            for _ in range(randint(min_input_len, max_input_len))
+        ]
         for _ in range(num_requests)
     ]
     sampling_params = [
         SamplingParams(
             temperature=0.6,
             ignore_eos=True,
-            max_tokens=randint(100, max_output_len),
+            max_tokens=randint(min_output_len, max_output_len),
         )
         for _ in range(num_requests)
     ]
     return prompt_token_ids, sampling_params, ["random"] * num_requests
+
+
+def _parse_int_csv(value: str, flag_name: str) -> list[int]:
+    try:
+        return [int(part.strip()) for part in value.split(",") if part.strip()]
+    except ValueError as exc:
+        raise ValueError(f"{flag_name} must be a comma-separated list of integers.") from exc
+
+
+def parse_nonnegative_int_csv(value: str, flag_name: str) -> list[int]:
+    values = _parse_int_csv(value, flag_name)
+    if not values:
+        raise ValueError(f"{flag_name} must include at least one value.")
+    if any(item < 0 for item in values):
+        raise ValueError(f"{flag_name} values must be non-negative integers.")
+    if len(set(values)) != len(values):
+        raise ValueError(f"{flag_name} values must be unique.")
+    return values
+
+
+def required_cuda_devices(dp_size: int, tp_size: int) -> int:
+    return dp_size * tp_size
+
+
+def select_device_ids(
+    device_ids: Optional[list[int]],
+    *,
+    dp_size: int,
+    tp_size: int,
+) -> Optional[list[int]]:
+    if device_ids is None:
+        return None
+    required = required_cuda_devices(dp_size, tp_size)
+    if len(device_ids) < required:
+        raise ValueError(
+            f"--device-ids must include at least {required} ids for "
+            f"data_parallel_size={dp_size} and tensor_parallel_size={tp_size}."
+        )
+    return list(device_ids[:required])
+
+
+def preflight_cuda_devices(
+    *,
+    dp_size: int,
+    tp_size: int,
+    device_ids: Optional[list[int]] = None,
+) -> None:
+    visible = torch.cuda.device_count()
+    required = required_cuda_devices(dp_size, tp_size)
+    if visible < required:
+        raise ValueError(
+            "data_parallel_size*tensor_parallel_size requires "
+            f"{required} CUDA devices, but only {visible} are visible."
+        )
+    selected_device_ids = select_device_ids(device_ids, dp_size=dp_size, tp_size=tp_size)
+    if selected_device_ids and max(selected_device_ids) >= visible:
+        raise ValueError(
+            f"--device-ids references cuda:{max(selected_device_ids)}, "
+            f"but only {visible} CUDA devices are visible."
+        )
 
 
 def generate_mixed_test_data(
@@ -451,6 +519,11 @@ def export_json(
             "batch_size": getattr(config, "batch_size", 32),
             "batch_interval": getattr(config, "batch_interval", 5.0),
             "workload": getattr(config, "workload", "mixed"),
+            "min_input_len": getattr(config, "min_input_len", 16),
+            "max_input_len": getattr(config, "max_input_len", 1024),
+            "min_output_len": getattr(config, "min_output_len", 8),
+            "max_output_len": getattr(config, "max_output_len", 1024),
+            "vocab_size": getattr(config, "vocab_size", 10000),
             "prompt_len_distribution": getattr(config, "prompt_len_distribution", "uniform"),
             "long_prompt_ratio": getattr(config, "long_prompt_ratio", 0.0),
             "short_input_len": getattr(config, "short_input_len", 0),
@@ -462,6 +535,9 @@ def export_json(
             "max_num_sequences": getattr(config, "max_num_sequences", 0),
             "max_prefill_tokens_per_step": getattr(config, "max_prefill_tokens_per_step", 0),
             "max_prefill_chunk_size": getattr(config, "max_prefill_chunk_size", 0),
+            "data_parallel_size": getattr(config, "data_parallel_size", 1),
+            "tensor_parallel_size": getattr(config, "tensor_parallel_size", 1),
+            "device_ids": getattr(config, "device_ids", None),
         },
         "aggregate": {
             "num_requests": agg.num_requests,
@@ -756,11 +832,15 @@ class DirectEngineRunner:
             completion_token_ids = []
 
             try:
-                gen = self._engine.generate(prompt_token_ids, sampling_params)
+                gen = self._engine.generate(prompt_token_ids, sampling_params, request_id=idx)
 
                 async def _consume():
                     nonlocal first_token_time, completion_time, final_output
                     async for output in gen:
+                        if output.request_id != idx:
+                            raise AssertionError(
+                                f"Request ID mismatch: expected {idx}, got {output.request_id}."
+                            )
                         if output.token_ids and first_token_time == 0.0:
                             first_token_time = time.perf_counter()
                         completion_token_ids.extend(output.token_ids)
@@ -1408,12 +1488,24 @@ Examples:
         help="Maximum concurrent requests. Default: 32.",
     )
     parser.add_argument(
+        "--min-input-len", type=int, default=16,
+        help="Minimum prompt tokens per request for random workload. Default: 16.",
+    )
+    parser.add_argument(
         "--max-input-len", type=int, default=1024,
         help="Maximum prompt tokens per request. Default: 1024.",
     )
     parser.add_argument(
+        "--min-output-len", type=int, default=8,
+        help="Minimum generated tokens per request for random workload. Default: 8.",
+    )
+    parser.add_argument(
         "--max-output-len", type=int, default=1024,
         help="Maximum generated tokens per request. Default: 1024.",
+    )
+    parser.add_argument(
+        "--vocab-size", type=int, default=10000,
+        help="Random token id range. Default: 10000.",
     )
     parser.add_argument(
         "--workload", type=str, default="mixed",
@@ -1488,6 +1580,15 @@ Examples:
         help="Number of tensor parallel replicas. Default: 1.",
     )
     parser.add_argument(
+        "--data-parallel-size", type=int, default=1,
+        help="Number of data parallel online replicas for direct or embedded-server mode. Default: 1.",
+    )
+    parser.add_argument(
+        "--device-ids",
+        default=None,
+        help="Optional comma-separated CUDA device ids for direct or embedded-server mode. Uses the first DP*TP ids.",
+    )
+    parser.add_argument(
         "--max-model-len", type=int, default=None,
         help="Maximum model context length for direct/embedded-server mode. "
              "For external HTTP mode, start the server with the same --max-model-len. "
@@ -1532,7 +1633,28 @@ Examples:
         help="Random seed for reproducibility. Default: 42.",
     )
 
-    return apply_scenario_preset(parser.parse_args())
+    args = apply_scenario_preset(parser.parse_args())
+    if args.num_requests <= 0:
+        raise ValueError("--num-requests must be positive.")
+    if args.concurrency <= 0:
+        raise ValueError("--concurrency must be positive.")
+    if args.min_input_len <= 0 or args.max_input_len <= 0:
+        raise ValueError("Input length bounds must be positive.")
+    if args.min_input_len > args.max_input_len:
+        raise ValueError("--min-input-len must be <= --max-input-len.")
+    if args.min_output_len <= 0 or args.max_output_len <= 0:
+        raise ValueError("Output length bounds must be positive.")
+    if args.min_output_len > args.max_output_len:
+        raise ValueError("--min-output-len must be <= --max-output-len.")
+    if args.vocab_size <= 0:
+        raise ValueError("--vocab-size must be positive.")
+    if args.data_parallel_size <= 0:
+        raise ValueError("--data-parallel-size must be positive.")
+    if args.tensor_parallel_size <= 0:
+        raise ValueError("--tensor-parallel-size must be positive.")
+    if args.device_ids is not None:
+        args.device_ids = parse_nonnegative_int_csv(args.device_ids, "--device-ids")
+    return args
 
 
 async def main() -> None:
@@ -1548,13 +1670,17 @@ async def main() -> None:
     print(f" Streaming        : {args.stream}")
     print(f" Requests         : {args.num_requests}")
     print(f" Concurrency      : {args.concurrency}")
-    print(f" Max Input Len    : {args.max_input_len}")
-    print(f" Max Output Len   : {args.max_output_len}")
+    print(f" Input Len        : {args.min_input_len}..{args.max_input_len}")
+    print(f" Output Len       : {args.min_output_len}..{args.max_output_len}")
     print(f" Max Model Len    : {args.max_model_len or 'engine default'}")
     print(f" Batch Tokens     : {args.max_num_batched_tokens}")
     print(f" Max Sequences    : {args.max_num_sequences}")
     print(f" Prefill Tokens   : {args.max_prefill_tokens_per_step}")
     print(f" Prefill Chunk    : {args.max_prefill_chunk_size}")
+    print(f" Data Parallel    : {args.data_parallel_size}")
+    print(f" Tensor Parallel  : {args.tensor_parallel_size}")
+    if args.device_ids is not None:
+        print(f" Device IDs       : {args.device_ids}")
     print(f" Workload         : {args.workload}")
     if args.workload == "mixed":
         print(f" Prompt Dist      : {args.prompt_len_distribution}")
@@ -1588,8 +1714,11 @@ async def main() -> None:
     else:
         prompt_token_ids_list, sampling_params_list, request_type_list = generate_random_test_data(
             num_requests=args.num_requests,
+            min_input_len=args.min_input_len,
             max_input_len=args.max_input_len,
+            min_output_len=args.min_output_len,
             max_output_len=args.max_output_len,
+            vocab_size=args.vocab_size,
             seed_val=args.seed,
         )
     total_prompt = sum(len(p) for p in prompt_token_ids_list)
@@ -1600,10 +1729,24 @@ async def main() -> None:
           f"up to {total_max_gen:,} generation tokens")
     print(f"Request types: {type_counts}")
 
+    selected_device_ids = select_device_ids(
+        args.device_ids,
+        dp_size=args.data_parallel_size,
+        tp_size=args.tensor_parallel_size,
+    )
+    if args.mode == "direct" or args.server_embedded:
+        preflight_cuda_devices(
+            dp_size=args.data_parallel_size,
+            tp_size=args.tensor_parallel_size,
+            device_ids=selected_device_ids,
+        )
+
     # Build engine kwargs (only used for direct mode or embedded server)
     engine_kwargs = {
         "enforce_eager": args.enforce_eager,
         "tensor_parallel_size": args.tensor_parallel_size,
+        "data_parallel_size": args.data_parallel_size,
+        "data_parallel_device_ids": selected_device_ids,
         "max_num_batched_tokens": args.max_num_batched_tokens,
         "max_num_sequences": args.max_num_sequences,
         "max_prefill_tokens_per_step": args.max_prefill_tokens_per_step,

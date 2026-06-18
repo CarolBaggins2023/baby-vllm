@@ -109,6 +109,12 @@ Examples:
              "Default: 1 (single GPU). Range: 1-8.",
     )
     parser.add_argument(
+        "--data-parallel-size", type=int, default=1,
+        help="Number of data parallel online replicas. "
+             "Each replica owns a full model and serves independent requests. "
+             "Default: 1.",
+    )
+    parser.add_argument(
         "--max-num-batched-tokens", type=int, default=16384,
         help="Maximum total tokens per batch per inference step. "
              "Limits VRAM usage during prefill. "
@@ -211,6 +217,7 @@ def build_engine_kwargs(args: argparse.Namespace) -> dict:
         "max_prefill_chunk_size": args.max_prefill_chunk_size,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "tensor_parallel_size": args.tensor_parallel_size,
+        "data_parallel_size": args.data_parallel_size,
         "enforce_eager": args.enforce_eager,
         "kvcache_block_size": args.kvcache_block_size,
         "num_kvcache_blocks": args.num_kvcache_blocks,
@@ -304,10 +311,10 @@ def main():
     #   3. Python process exits
     # =====================================================================
 
-    # WHY: Read host/port from engine.engine.config instead of raw CLI args.
+    # WHY: Read host/port from engine.config instead of raw CLI args.
     # At this point engine_kwargs (which included host/port) has been piped
     # through LLMEngine.__init__ → Config.__init__ → Config.__post_init__
-    # validation.  So engine.engine.config holds the validated, canonical
+    # validation.  So engine.config holds the validated, canonical
     # values.  Using raw args would bypass validation — e.g. if a bug let an
     # out-of-range port into args, it would only be caught here by uvicorn
     # (late failure), not by Config.__post_init__ (early failure).
@@ -316,11 +323,11 @@ def main():
     # but Config.__post_init__ raises AssertionError("port must be between
     # 1 and 65535") before the model is loaded.  Then this code never runs —
     # a fast failure rather than a slow failure after GPU allocation.
-    print(f"Starting server on {engine.engine.config.host}:{engine.engine.config.port}...")
+    print(f"Starting server on {engine.config.host}:{engine.config.port}...")
     uvicorn.run(
         api_server.app,
-        host=engine.engine.config.host,
-        port=engine.engine.config.port,
+        host=engine.config.host,
+        port=engine.config.port,
         log_level=args.log_level,
     )
 

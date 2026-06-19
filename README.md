@@ -12,6 +12,10 @@ baby-vllm is a lightweight, learning-oriented LLM inference project based on nan
 - Adds online HTTP serving for basic streaming inference experiments.
 - Adds single-node tensor parallelism (TP) and data parallelism (DP) for local multi-GPU offline and online inference.
 
+## Documentation
+
+- [Inference engine flowcharts](docs/flowchart/README.md): Mermaid diagrams for the core offline, online, scheduler, KV cache, model runner, attention, parallelism, and Qwen3 model paths.
+
 ## Branches
 
 The branches in this repository also record the order in which the project was implemented and studied.
